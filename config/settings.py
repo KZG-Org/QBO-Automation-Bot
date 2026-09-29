@@ -26,6 +26,7 @@ CTRL_COL_QBO_SYNC = "QBO Sync"
 CTRL_COL_LAST_RUN_AT = "Last Run At"
 CTRL_COL_LAST_PROCESSED_ROW = "Last Processed Row"
 CTRL_COL_PENDING_NOS_NOTE = "Pending Nos Note"
+CTRL_COL_TRANSFORM_NOTE = "Transform Note"  # why Transform stopped (e.g. broken raw No column); created on first use
 
 # Raw data expectations
 RAW_COL_NO = os.getenv("RAW_COL_NO", "No")  # incremental row id / sequence

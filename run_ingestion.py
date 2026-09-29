@@ -25,6 +25,7 @@ from src.logic.syncing import QBOSync
 from src.logic.transformer import transform_raw, _build_id_prefixes
 from src.utils.logger import setup_logger
 from src.logic.raw_adapter import standardize_raw_df, read_s5_raw_df, RAW_STANDARD_COLUMNS
+from src.logic.no_column_check import check_raw_no_column
 from src.utils.run_lock import single_instance_lock
 from gspread.utils import rowcol_to_a1
 
@@ -147,6 +148,7 @@ def _read_source_raw_df(gs, source_url: str, raw_tab_name: str, client_name: str
                     logger.info(
                         f"   [{client_name}] Using legacy KZP source header row {header_row}."
                     )
+                raw_df.attrs["header_row"] = header_row
                 return raw_df
 
         raise ValueError(
@@ -166,12 +168,15 @@ def _read_source_raw_df(gs, source_url: str, raw_tab_name: str, client_name: str
     else:
         source_header_row = 1
 
-    return gs.read_as_df(
+    raw_df = gs.read_as_df(
         source_url,
         raw_tab_name,
         header_row=source_header_row,
         value_render_option="UNFORMATTED_VALUE",
     )
+    # Lets the No-column check map a frame row back to its sheet row.
+    raw_df.attrs["header_row"] = source_header_row
+    return raw_df
 
 def _parse_no_set(raw_val) -> set[int]:
     if pd.isna(raw_val) or str(raw_val).strip() == "":
@@ -690,6 +695,22 @@ def process_client_control_sheet(
                 raw_tab_name,
                 client_name,
             )
+
+            # 6a. A broken 'No' column (blocked ARRAYFORMULA/SEQUENCE, or #REF! rows) would
+            #     make every affected row silently look unnumbered. Stop and say what to fix.
+            no_column_problem = check_raw_no_column(gs, source_url, raw_tab_name, raw_df, client_name, country)
+            if no_column_problem:
+                logger.warning(f"   ⛔ [{client_name}] Row {row_num}: {no_column_problem}")
+                if settings.CTRL_COL_TRANSFORM_NOTE not in ctrl_df.columns:
+                    gs.update_cell(control_sheet_id, settings.CONTROL_TAB_NAME, 1, len(ctrl_df.columns) + 1, settings.CTRL_COL_TRANSFORM_NOTE)
+                    ctrl_df[settings.CTRL_COL_TRANSFORM_NOTE] = ""
+                _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {
+                    settings.CTRL_COL_ACTIVE: "ERROR",
+                    settings.CTRL_COL_TRANSFORM_NOTE: no_column_problem,
+                    settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(),
+                })
+                continue
+
             raw_df = standardize_raw_df(raw_df, client_name=client_name, raw_month=raw_month)
 
             # --- LOGGING START ---
@@ -851,6 +872,7 @@ def process_client_control_sheet(
                     settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(),
                     COL_PENDING_AMOUNT_NOS: _serialize_no_set(pending_to_write), # <-- ADDED
                     settings.CTRL_COL_PENDING_NOS_NOTE: pending_nos_note,
+                    settings.CTRL_COL_TRANSFORM_NOTE: "",  # clears an earlier No-column message
                     settings.CTRL_COL_ACTIVE: "DONE"
                 }
                 # Install/repair KZO's live checkpoint formula even on a run with nothing to
@@ -970,6 +992,7 @@ def process_client_control_sheet(
                 COL_LAST_TR: result.last_withdraw_no,
                 COL_PENDING_AMOUNT_NOS: _serialize_no_set(pending_to_write), # <-- ADDED
                 settings.CTRL_COL_PENDING_NOS_NOTE: pending_nos_note,
+                settings.CTRL_COL_TRANSFORM_NOTE: "",  # clears an earlier No-column message
                 settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(),
                 settings.CTRL_COL_ACTIVE: "DONE"
             }

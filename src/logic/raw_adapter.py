@@ -490,7 +490,9 @@ def read_s5_raw_df(gs, source_url: str, raw_tab_name: str, client_name: str = "S
             S5_DEFAULT_HEADER_ROW,
         )
 
-    return gs.df_from_values(values, header_row)
+    df = gs.df_from_values(values, header_row)
+    df.attrs["header_row"] = header_row  # lets callers map frame rows back to sheet rows
+    return df
 
 
 def _standardize_s5(
@@ -609,6 +611,34 @@ def standardize_raw_df(raw_df: pd.DataFrame, client_name: str, raw_month: str) -
         return pd.DataFrame(columns=RAW_STANDARD_COLUMNS)
 
     cleaned = _clean_headers(raw_df)
+    layout = _raw_layout(cleaned, client_name)
+    if "kzo" in str(client_name).lower() and layout != "kzo":
+        # The legacy positional layout maps columns by index, so a KZO tab that lands here
+        # by accident produces silently wrong data (most visibly No=0 for every row) rather
+        # than an error. Say so.
+        logger.warning(
+            "⚠️ [%s] KZO header shape not recognised; falling back to the legacy positional "
+            "layout. Check the raw tab headers: CO/COY, USD - QBO, the QBO Import Method "
+            "column and 'Checking ( For our use only )'. Columns found: %s",
+            client_name,
+            list(cleaned.columns)[:28],
+        )
+    if layout == "kzo":
+        return _standardize_kzo(cleaned)
+    if layout == "umber":
+        # Umber exports have two "Date" columns; Q (the second Date) is the source-of-truth date.
+        return _standardize_s5(cleaned, prefer_secondary_date=True, preserve_source_currency=True)
+    if layout == "s5":
+        return _standardize_s5(cleaned)
+    if layout == "kzp":
+        return _standardize_kzp(cleaned, raw_month)
+    if layout == "kzdw":
+        return _standardize_kzdw(cleaned)
+    return _standardize_legacy(cleaned)
+
+
+def _raw_layout(cleaned: pd.DataFrame, client_name: str) -> str:
+    """Which standardizer reads this raw tab: kzdw / kzo / umber / s5 / kzp / legacy."""
     client_lower = str(client_name).lower()
     is_kzp_client = "kzp" in client_lower
     is_s5_client = "s5" in client_lower
@@ -660,27 +690,42 @@ def standardize_raw_df(raw_df: pd.DataFrame, client_name: str, raw_month: str) -
     )
 
     if is_kzdw_client:
-        return _standardize_kzdw(cleaned)
+        return "kzdw"
     if is_kzo_client and has_kzo_header_shape:
-        return _standardize_kzo(cleaned)
-    if is_kzo_client:
-        # The legacy positional layout maps columns by index, so a KZO tab that lands here
-        # by accident produces silently wrong data (most visibly No=0 for every row) rather
-        # than an error. Say so.
-        logger.warning(
-            "⚠️ [%s] KZO header shape not recognised; falling back to the legacy positional "
-            "layout. Check the raw tab headers: CO/COY, USD - QBO, the QBO Import Method "
-            "column and 'Checking ( For our use only )'. Columns found: %s",
-            client_name,
-            list(cleaned.columns)[:28],
-        )
+        return "kzo"
     if is_umber_client:
-        # Umber exports have two "Date" columns; Q (the second Date) is the source-of-truth date.
-        return _standardize_s5(cleaned, prefer_secondary_date=True, preserve_source_currency=True)
+        return "umber"
     if is_s5_client or has_s5_shape:
-        return _standardize_s5(cleaned)
+        return "s5"
     if is_kzp_client or has_kzp_shape:
-        return _standardize_kzp(cleaned, raw_month)
+        return "kzp"
     if has_kzdw_shape:
-        return _standardize_kzdw(cleaned)
-    return _standardize_legacy(cleaned)
+        return "kzdw"
+    return "legacy"
+
+
+def raw_no_column(raw_df: pd.DataFrame, client_name: str) -> tuple[int | None, str]:
+    """(0-based position of the column standardize_raw_df reads 'No' from, layout name).
+
+    Position is None when the layout has no 'No' column to read. Only the headers are used.
+    """
+    cleaned = _clean_headers(raw_df.iloc[:0])
+    layout = _raw_layout(cleaned, client_name)
+    if layout == "legacy":
+        pos = RAW_STANDARD_COLUMNS.index("No")
+        return (pos if pos < cleaned.shape[1] else None), layout
+    name = _resolve_kzo_no_col(cleaned) if layout == "kzo" else _find_col(cleaned, ["No"])
+    return (list(cleaned.columns).index(name) if name is not None else None), layout
+
+
+def missing_kzo_headers(raw_df: pd.DataFrame) -> list[str]:
+    """Headers the KZO layout needs that this raw tab's header row lacks."""
+    cleaned = _clean_headers(raw_df.iloc[:0])
+    needed = [
+        ("CO", _resolve_kzo_co_col(cleaned)),
+        ("COY", _find_col(cleaned, ["COY"])),
+        ("USD - QBO", _find_col(cleaned, ["USD - QBO"])),
+        ("QBO Import Method", _find_col(cleaned, KZO_METHOD_ALIASES)),
+        (KZO_CHECK_ALIASES[0], _find_col(cleaned, KZO_CHECK_ALIASES)),
+    ]
+    return [label for label, found in needed if found is None]

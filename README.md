@@ -78,6 +78,35 @@ A raw row is held in `Pending Amount Nos` (not pushed to QBO) when it has a `QBO
 but `USD - QBO` is 0. Once the amount is filled in, the next run picks the row up
 automatically, even though its `No.` is already below `Last Processed Row`.
 
+### Transform stops when the raw `No` column is broken
+
+Every raw tab numbers its rows with one array formula (`ARRAYFORMULA` / `SEQUENCE`) at the top
+of the `No` column. Right after reading the raw tab (step 6a), ingestion looks for Sheets errors
+(`#REF!`, `#N/A`, `#VALUE!`, …) in that column. If it finds any, that control row is **not
+transformed**: `Transform` becomes `ERROR` and a new **`Transform Note`** column (created on first
+use) says what to fix. The note is cleared on the next successful run.
+
+The two error cases are told apart by reading that one column's formulas (only when an error is
+present). The same step also stops when the bot cannot find the `No` column at all:
+
+| Case | Message (example) |
+|---|---|
+| The formula is **blocked** by text typed below it, so no row gets a No | `⛔ TH COY raw file (tab 'Transaction 2026 (COY TH)'): the No formula in AA5832 is blocked by text in AA6001, AA6002. Delete that text, then set Transform to READY again.` |
+| One **row** has an error No (its Date or QBO Import cell is broken) | `⛔ TH COY raw file (tab 'Transaction 2026 (COY TH)'): No shows #REF! in row 29496 (usually a broken Date or QBO Import cell). Fix or delete that row, then set Transform to READY again.` |
+| A KZO tab's **header row** lost a column the layout needs, so the adapter would fall back to the legacy layout and read `No` from `Transfer to` | `⛔ TH COY raw file (tab 'Transaction 2026 (COY TH)'): row 1 is missing the header 'Checking ( For our use only )', so the bot cannot find the No column. Put it back (it must sit just left of the No column), then set Transform to READY again.` |
+| Another client's raw tab has no `No` header | `⛔ KZDW raw file (tab '2026 transactions (new)'): row 5 has no 'No' header, so the bot cannot number the rows. Put it back, then set Transform to READY again.` |
+
+KZO messages name the country (`TH COY raw file`); other clients name the client (`KZDW raw
+file`). Up to 10 cells or rows are listed, then `(+N more)`; Google's error explanation is cut to
+the code (`#REF!`). The bot does not edit raw files. The column checked is exactly the one the
+transform reads `No` from: `raw_adapter.raw_no_column()` reports it from the same layout choice
+(`_raw_layout()`) that `standardize_raw_df()` uses. A KZO tab that really is in the old
+positional layout (numbers in column Y) is not stopped. Code: `src/logic/no_column_check.py`.
+
+KZO's control sheet also has a `No Column Check` column (T, `ISERROR(IMPORTRANGE(…))`) that the
+KZO bulk menu reads. That formula points at column `Y` for most months, not `AA` where KZO's
+`No` is, so it can disagree with the check above.
+
 ### Duplicate protection: the Transform file outranks `Last Processed Row`
 
 `Last Processed Row` is a checkpoint, not a record. Rows are appended to the Transform file
