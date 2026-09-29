@@ -444,24 +444,38 @@ to a category account.
 KZO only. UMBER has its own `Category = Transfer` handling in the standard-journal branch;
 KZP, KZDW and S5 keep the plain single-line reclass behavior.
 
-### KZDW COY hold
+### KZDW COY filter (DPP only)
 
-`run_ingestion.py` has a switch for holding KZDW rows by `COY` value:
+KZDW posts only rows whose `COY` is listed in `run_ingestion.py`:
 
 ```python
-KZDW_FORCED_PENDING_COY_VALUES: set[str] = {"TD"}
+KZDW_ALLOWED_COY_VALUES: set[str] = {"DPP"}
 ```
 
-Any `COY` listed there (case-insensitive, whitespace-trimmed) stays in `Pending Amount Nos`
-for KZDW regardless of amount or method, and is skipped by new/late-filled/retry processing.
-Emptying the set releases those rows on the next run — they come back through the
-late-filled path and post normally. The hold applies to the `KZDW` workspace only, never to
-TINDERPAY.
+Step 9b of ingestion (after the date and `Exclude` filters) drops every KZDW row whose `COY`
+(case-insensitive, whitespace-trimmed) is not in that set — `TD`, `KZDW`, blank, anything else —
+and logs the dropped counts per `COY`:
 
-Status: **`COY = TD` is held in KZDW** because it posts to its own QBO company, TINDERPAY
-(below), from 2026-09-25. History: held 2026-07-22, released 2026-07-30 once its posting logic
-was confirmed, held again 2026-09-25 when TINDERPAY went live. TD rows KZDW posted before
-2026-09-25 stay in KZDW's QBO. Releasing the hold now would post TD rows in both companies.
+```
+🏷️ [KZDW] Step 9b: COY Filter (DPP only) -> Kept: 833 | Dropped: 892 {'TD': 892}
+```
+
+Dropped rows are gone for that run: they are not new, not written to `Pending Amount Nos`, and
+not retried from ERROR. A row whose `COY` is corrected to `DPP` later is picked up only if its
+`No` is still above `Last Processed Row`. The filter applies to the `KZDW` workspace only, never
+to TINDERPAY.
+
+Why a filter and not a pending hold: KZDW's raw `No` is positional (month, day, then the row's
+position within that date), so deleting TD rows from the raw tab renumbers the DPP rows after
+them. Held TD Nos parked in `Pending Amount Nos` could then point at a different, already-posted
+DPP row and post it again through the late-filled path.
+
+`COY = KZDW` appears only in the Jan–Jun 2026 raw rows, and those control rows are `CLOSED`.
+Reopening one of those months would transform nothing until `KZDW` is added to the set.
+
+History: `COY = TD` held as pending 2026-07-22, released 2026-07-30, held again 2026-09-25 when
+TINDERPAY went live, replaced by this DPP-only filter 2026-09-29. TD rows KZDW posted before
+2026-09-25 are still in KZDW's QBO and in the KZDW Transform files (Location `TDTH`).
 
 ### TINDERPAY: KZDW's TD business in its own QBO company
 
@@ -477,7 +491,7 @@ What differs from KZDW:
 |---|---|---|
 | Journal No | `KZDW-JV0001` | `TDP-JV0001` |
 | Expense / Transfer ref | `KZDW0926E0001` / `KZDW0926T0001` | `TDP0926E0001` / `TDP0926T0001` |
-| COY=TD hold | held | posted |
+| COY rows posted | `DPP` only ([filter](#kzdw-coy-filter-dpp-only)) | all (its raw is TD) |
 
 The QBO journal-number lookup in `run_ingestion.py` takes its prefix from the transformer's
 `_build_id_prefixes()`, so it always queries the prefix actually minted.

@@ -91,40 +91,40 @@ class SourceHeaderRoutingTests(unittest.TestCase):
                 )
 
 
-class KzdwForcedPendingTests(unittest.TestCase):
-    def test_only_td_is_held_by_default(self):
-        # COY=TD posts to its own QBO company (TINDERPAY), so KZDW holds it.
-        raw_df = pd.DataFrame({"COY": ["TD", " td ", "DPP"]})
+class KzdwCoyFilterTests(unittest.TestCase):
+    def test_only_dpp_is_kept_by_default(self):
+        raw_df = pd.DataFrame({"COY": ["DPP", " dpp ", "TD", "KZDW", "", None]})
 
-        mask = run_ingestion._get_kzdw_forced_pending_mask(raw_df, "KZDW")
+        kept, dropped = run_ingestion._filter_kzdw_coy(raw_df, "KZDW")
 
-        self.assertEqual(run_ingestion.KZDW_FORCED_PENDING_COY_VALUES, {"TD"})
-        self.assertEqual(mask.tolist(), [True, True, False])
+        self.assertEqual(run_ingestion.KZDW_ALLOWED_COY_VALUES, {"DPP"})
+        self.assertEqual(kept.index.tolist(), [0, 1])
+        self.assertEqual(dropped, {"TD": 1, "KZDW": 1, "(blank)": 2})
 
-    def test_held_coy_values_are_matched_case_insensitively(self):
-        raw_df = pd.DataFrame({"COY": ["TD", " td ", "Td", "TDD", "", None]})
+    def test_nothing_dropped_when_every_row_is_dpp(self):
+        raw_df = pd.DataFrame({"COY": ["DPP", "DPP"]}, index=[4, 9])
 
-        with patch.object(run_ingestion, "KZDW_FORCED_PENDING_COY_VALUES", {"TD"}):
-            mask = run_ingestion._get_kzdw_forced_pending_mask(raw_df, "KZDW")
+        kept, dropped = run_ingestion._filter_kzdw_coy(raw_df, "KZDW")
 
-        self.assertEqual(mask.tolist(), [True, True, True, False, False, False])
+        self.assertEqual(kept.index.tolist(), [4, 9])
+        self.assertEqual(dropped, {})
 
-    def test_held_rows_are_not_forced_pending_for_other_clients(self):
-        raw_df = pd.DataFrame({"COY": ["TD", "td"]}, index=[4, 9])
+    def test_other_clients_are_not_filtered(self):
+        raw_df = pd.DataFrame({"COY": ["TD", "KZO", ""]}, index=[4, 9, 11])
 
-        with patch.object(run_ingestion, "KZDW_FORCED_PENDING_COY_VALUES", {"TD"}):
-            mask = run_ingestion._get_kzdw_forced_pending_mask(raw_df, "KZO")
+        kept, dropped = run_ingestion._filter_kzdw_coy(raw_df, "KZO")
 
-        self.assertEqual(mask.to_dict(), {4: False, 9: False})
+        self.assertIs(kept, raw_df)
+        self.assertEqual(dropped, {})
 
-    def test_forced_nos_are_kept_even_above_processed_checkpoint(self):
-        pending_nos = run_ingestion._pending_nos_for_control(
-            current_pending_nos={2, 6, 9},
-            max_processed_no=6,
-            forced_pending_nos={9, 12, -1},
-        )
+    def test_missing_coy_column_drops_every_kzdw_row(self):
+        # No COY means no proof a row is DPP; posting it could double-post a TD row.
+        raw_df = pd.DataFrame({"No": [1, 2]})
 
-        self.assertEqual(pending_nos, {2, 6, 9, 12})
+        kept, dropped = run_ingestion._filter_kzdw_coy(raw_df, "KZDW")
+
+        self.assertTrue(kept.empty)
+        self.assertEqual(dropped, {"(blank)": 2})
 
 
 class DecodeKzoNoTests(unittest.TestCase):

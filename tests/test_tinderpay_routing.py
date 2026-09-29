@@ -75,22 +75,23 @@ class TinderpayLayoutRoutingTests(unittest.TestCase):
         self.assertFalse(syncing._is_kzdw_workspace("KZO"))
 
 
-class TdHoldTests(unittest.TestCase):
-    """COY=TD moved to TINDERPAY: KZDW holds it, TINDERPAY posts it."""
+class TdCoyFilterTests(unittest.TestCase):
+    """COY=TD belongs to TINDERPAY: KZDW drops it, TINDERPAY posts it."""
 
-    def test_kzdw_holds_td_rows(self):
+    def test_kzdw_drops_td_rows(self):
         raw_df = pd.DataFrame({"COY": ["TD", " td ", "DPP", "KZDW"]})
 
-        mask = run_ingestion._get_kzdw_forced_pending_mask(raw_df, "KZDW")
+        kept, _ = run_ingestion._filter_kzdw_coy(raw_df, "KZDW")
 
-        self.assertEqual(mask.tolist(), [True, True, False, False])
+        self.assertEqual(kept["COY"].tolist(), ["DPP"])
 
-    def test_tinderpay_does_not_hold_its_own_td_rows(self):
+    def test_tinderpay_keeps_its_own_td_rows(self):
         raw_df = pd.DataFrame({"COY": ["TD", "td"]})
 
-        mask = run_ingestion._get_kzdw_forced_pending_mask(raw_df, "TINDERPAY")
+        kept, dropped = run_ingestion._filter_kzdw_coy(raw_df, "TINDERPAY")
 
-        self.assertEqual(mask.tolist(), [False, False])
+        self.assertIs(kept, raw_df)
+        self.assertEqual(dropped, {})
 
 
 if __name__ == "__main__":
