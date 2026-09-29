@@ -173,5 +173,80 @@ class RawVsTransformEstNoTests(unittest.TestCase):
         self.assertEqual(updates[0]["status"], "Unmatched: Amt Diff (999.00 vs 50.00)")
 
 
+class JournalLineMatchingTests(unittest.TestCase):
+    """reconcile_journals pairs each sheet line with one QBO line of the same journal."""
+
+    @staticmethod
+    def _line(posting, amount, account, description=""):
+        return {"Amount": amount, "DetailType": "JournalEntryLineDetail", "Description": description,
+                "JournalEntryLineDetail": {"PostingType": posting, "AccountRef": {"name": account}}}
+
+    def _run(self, sheet_lines, qbo_lines):
+        client = MagicMock()
+        client.client_name = "KZDW"
+        client.query.return_value = [{"Id": "11999", "DocNumber": "KZDW-JV0666", "TxnDate": "2026-09-11", "Line": qbo_lines}]
+        df = pd.DataFrame([{"Journal No": "KZDW-JV0666", "Date": "9/11/2026", "Account": line[0], "Amount": line[1],
+                            "Memo": line[2] if len(line) > 2 else "", "QBO ID": "11999"}
+                           for line in sheet_lines])
+        updates = Reconciler(client).reconcile_journals(df, "2026-09-01")
+        return [u["status"] for u in sorted(updates, key=lambda u: u["row_idx"])]
+
+    def test_fallback_of_an_earlier_row_does_not_steal_a_later_exact_match(self):
+        # KZDW-JV0666 after its TD lines were removed from QBO: rows 2-3 are still in the
+        # sheet, and row 3 (FIN OPS 400,000) used to claim QBO's FIN OPS 29,347.18 line through
+        # the account-only fallback, leaving the real row 5 with "No matching line".
+        statuses = self._run(
+            [("KZDW DPP TH 2", -300.0), ("Payment/Banking", 300.0),
+             ("Amount Owing (by)/to KZO", -400000.0), ("KZDW FIN OPS TRC 1", 400000.0),
+             ("System Fees Rebate from HengSlip", -29347.18), ("KZDW FIN OPS TRC 1", 29347.18)],
+            [self._line("Credit", 300.0, "Cash on Hand:KZDW DPP TH 2"),
+             self._line("Debit", 300.0, "Miscellaneous:Payment/Banking"),
+             self._line("Credit", 29347.18, "DPP:System Fees Rebate from HengSlip"),
+             self._line("Debit", 29347.18, "Cash on Hand:KZDW FIN OPS TRC 1")],
+        )
+        self.assertEqual([statuses[i] for i in (0, 1, 4, 5)], ["✅ Matched"] * 4)
+        self.assertTrue(statuses[2].startswith("❌ No matching line"))
+        self.assertTrue(statuses[3].startswith("❌ No matching line"))
+
+    def test_fallbacks_still_report_account_and_amount_mismatches(self):
+        statuses = self._run(
+            [("KZDW DPP TH 2", -300.0), ("Payment/Banking", 250.0), ("Exchange Loss", 50.0)],
+            [self._line("Credit", 300.0, "Cash on Hand:KZDW DPP TH 2"),
+             self._line("Debit", 250.0, "Miscellaneous:Payment/Banking"),
+             self._line("Debit", 50.0, "Payment:Exchange Gain")],
+        )
+        self.assertEqual(statuses[0], "✅ Matched")
+        self.assertEqual(statuses[1], "✅ Matched")
+        self.assertTrue(statuses[2].startswith("❌ Account Mismatch"), statuses[2])
+
+    def test_amount_mismatch_is_reported_when_only_the_account_matches(self):
+        statuses = self._run(
+            [("KZDW DPP TH 2", -300.0), ("Payment/Banking", 310.0)],
+            [self._line("Credit", 300.0, "Cash on Hand:KZDW DPP TH 2"),
+             self._line("Debit", 300.0, "Miscellaneous:Payment/Banking")],
+        )
+        self.assertEqual(statuses[0], "✅ Matched")
+        self.assertTrue(statuses[1].startswith("❌ Amount Mismatch"), statuses[1])
+
+    def test_amount_mismatch_pairs_with_the_closest_amount(self):
+        # Both sheet amounts were edited; each should be compared with its nearest QBO line,
+        # not with whichever same-account line happens to come first in QBO.
+        statuses = self._run(
+            [("KZDW FIN OPS TRC 1", 29000.0), ("KZDW FIN OPS TRC 1", 400000.0)],
+            [self._line("Debit", 399000.0, "Cash on Hand:KZDW FIN OPS TRC 1"),
+             self._line("Debit", 29347.18, "Cash on Hand:KZDW FIN OPS TRC 1")],
+        )
+        self.assertEqual(statuses, ["❌ Amount Mismatch (Sheet: 29000.0 vs QBO: 29347.18)",
+                                    "❌ Amount Mismatch (Sheet: 400000.0 vs QBO: 399000.0)"])
+
+    def test_account_mismatch_prefers_the_line_with_the_same_description(self):
+        statuses = self._run(
+            [("Exchange Loss", 50.0, "Weekly exchange loss from TH PGW")],
+            [self._line("Debit", 50.0, "Payment:Bank Charges", "Transfer service fee"),
+             self._line("Debit", 50.0, "Payment:Exchange Gain", "Weekly exchange loss from TH PGW")],
+        )
+        self.assertEqual(statuses, ["❌ Account Mismatch (Sheet: 'Exchange Loss' vs QBO: 'exchange gain')"])
+
+
 if __name__ == "__main__":
     unittest.main()

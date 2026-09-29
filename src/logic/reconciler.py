@@ -294,68 +294,55 @@ class Reconciler:
                     "full_name": full_acc_name, # Stored for matching
                     "display_name": self._normalize_account(full_acc_name), # Stored for error msg
                     "amount": amt,
+                    # Sync writes the sheet's Memo into each line's Description; used to break ties.
+                    "description": re.sub(r"\s+", " ", str(line.get("Description") or "")).strip(),
                     "matched": False
                 })
 
             # 5. MATCH SHEET ROWS TO QBO LINES
-            for idx, row in group.iterrows():
-                row_status = "✅ Matched"
-                if header_errors:
-                    row_status = f"⚠️ Header: {'; '.join(header_errors)}"
+            # Each pass runs over the whole journal before the next one starts, so a row's
+            # fallback (amount-only / account-only) can never claim a QBO line that a later
+            # row matches exactly. Row by row, a sheet line already removed from QBO took the
+            # next same-account line as an "Amount Mismatch" and left its real owner unmatched.
+            ok_status = f"⚠️ Header: {'; '.join(header_errors)}" if header_errors else "✅ Matched"
+            pending = [
+                (idx, str(self._row_get_scalar(row, "Account", "")),
+                 self._safe_float(self._row_get_scalar(row, "Amount", 0)),
+                 re.sub(r"\s+", " ", str(self._row_get_scalar(row, "Memo", "") or "")).strip())
+                for idx, row in group.iterrows()
+            ]
+            status_by_idx = {}
 
-                sheet_acc_raw = str(self._row_get_scalar(row, "Account", ""))
-                sheet_amt = self._safe_float(self._row_get_scalar(row, "Amount", 0))
+            def claim(accept, describe):
+                for idx, sheet_acc_raw, sheet_amt, sheet_memo in pending:
+                    if idx in status_by_idx:
+                        continue
+                    candidates = [q for q in qbo_lines_pool if not q["matched"] and accept(sheet_acc_raw, sheet_amt, q)]
+                    if not candidates:
+                        continue
+                    # Among the lines this pass accepts, prefer the one carrying this row's memo,
+                    # then the nearest amount; min() keeps QBO's line order for full ties.
+                    q_line = min(candidates, key=lambda q: (q["description"] != sheet_memo, abs(q["amount"] - sheet_amt)))
+                    q_line["matched"] = True
+                    status_by_idx[idx] = describe(sheet_acc_raw, sheet_amt, q_line)
 
-                found_match = False
-                
-                # Pass 1: FUZZY Account Match AND Strict Amount Match
-                for q_line in qbo_lines_pool:
-                    if not q_line["matched"]:
-                        # Use new fuzzy helper
-                        is_acc_match = self._is_account_match(sheet_acc_raw, q_line["full_name"])
-                        is_amt_match = abs(q_line["amount"] - sheet_amt) < 0.01
+            # Pass 1: Account AND Strict Amount Match
+            claim(lambda acc, amt, q: self._is_account_match(acc, q["full_name"]) and abs(q["amount"] - amt) < 0.01,
+                  lambda acc, amt, q: ok_status)
+            # Pass 2: Amount Match ONLY (Wrong Account)
+            claim(lambda acc, amt, q: abs(q["amount"] - amt) < 0.01,
+                  lambda acc, amt, q: f"{header_status_prefix}❌ Account Mismatch (Sheet: '{acc}' vs QBO: '{q['display_name']}')")
+            # Pass 3: Account Match ONLY (Wrong Amount)
+            claim(lambda acc, amt, q: self._is_account_match(acc, q["full_name"]),
+                  lambda acc, amt, q: f"{header_status_prefix}❌ Amount Mismatch (Sheet: {amt} vs QBO: {q['amount']})")
 
-                        if is_acc_match and is_amt_match:
-                            q_line["matched"] = True
-                            found_match = True
-                            break
-                
-                if found_match:
-                    updates.append({"row_idx": idx, "status": row_status})
-                    continue
-
-                # Pass 2: Amount Match ONLY (Wrong Account)
-                for q_line in qbo_lines_pool:
-                    if not q_line["matched"]:
-                        if abs(q_line["amount"] - sheet_amt) < 0.01:
-                            updates.append({
-                                "row_idx": idx, 
-                                "status": f"{header_status_prefix}❌ Account Mismatch (Sheet: '{sheet_acc_raw}' vs QBO: '{q_line['display_name']}')"
-                            })
-                            q_line["matched"] = True
-                            found_match = True
-                            break
-                
-                if found_match: continue
-
-                # Pass 3: FUZZY Account Match ONLY (Wrong Amount)
-                for q_line in qbo_lines_pool:
-                    if not q_line["matched"]:
-                        if self._is_account_match(sheet_acc_raw, q_line["full_name"]):
-                            updates.append({
-                                "row_idx": idx, 
-                                "status": f"{header_status_prefix}❌ Amount Mismatch (Sheet: {sheet_amt} vs QBO: {q_line['amount']})"
-                            })
-                            q_line["matched"] = True
-                            found_match = True
-                            break
-                
-                if found_match: continue
-
+            for idx, sheet_acc_raw, sheet_amt, _ in pending:
                 # Pass 4: No match found
                 updates.append({
-                    "row_idx": idx, 
-                    "status": f"{header_status_prefix}❌ No matching line in QBO for '{sheet_acc_raw}' : {sheet_amt}"
+                    "row_idx": idx,
+                    "status": status_by_idx.get(
+                        idx, f"{header_status_prefix}❌ No matching line in QBO for '{sheet_acc_raw}' : {sheet_amt}"
+                    ),
                 })
 
         return updates

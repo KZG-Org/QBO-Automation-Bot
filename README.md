@@ -270,6 +270,23 @@ in practice it produced far too many false positives against legitimate recurrin
 same-amount transactions (e.g. daily fixed-amount transfers) to be useful, and stayed only as
 per-transaction reconcile via `est. No:` above.
 
+### Journal reconcile: how sheet lines are paired with QBO lines
+
+`Reconciler.reconcile_journals` finds the QBO journal (by `QBO ID`, else by `Journal No`) and
+pairs every sheet line with one unused line of that journal, in four passes:
+
+1. same account **and** same signed amount → `✅ Matched`
+2. same amount, different account → `❌ Account Mismatch (Sheet: … vs QBO: …)`
+3. same account, different amount → `❌ Amount Mismatch (Sheet: … vs QBO: …)`
+4. nothing left → `❌ No matching line in QBO for '…' : …`
+
+Each pass runs over **all** lines of the journal before the next pass starts. Before
+2026-09-29 the passes ran row by row, so a sheet line whose QBO line had been removed (e.g. a
+TD line taken out of a KZDW journal) could claim a later row's exact line through pass 3 and
+leave that row wrongly `No matching line`. Seen on `KZDW-JV0666`: the stale `KZDW FIN OPS TRC 1
+400,000` row took the `KZDW FIN OPS TRC 1 29,347.18` line away from the Hengslip fee row. Now
+exact matches are handed out first, so a line QBO really has is always `✅ Matched`.
+
 ### Account matching: no fuzzy guessing for accounts
 
 Account names from the sheet are resolved against QBO by **exact match**, then **suffix-path
