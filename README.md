@@ -48,6 +48,15 @@ Client-specific logic differs across KZO, KZP, KZDW, S5, and UMBER (TINDERPAY ru
 - `src/logic/syncing.py`
 - `src/logic/reconciler.py`
 
+## Apps Script buttons (`appscript/`)
+
+The `READY` / `SYNC NOW` / `RECONCILE NOW` dropdowns on each client's `JOBS CONTROL` tab reach the
+bot through an Apps Script project bound to that control sheet, which posts to `server.py`'s
+`/webhook`. `appscript/<client>/` holds a `clasp` clone of each project (KZO, KZP, KZDW, S5,
+UMBER, TINDERPAY). See [appscript/README.md](appscript/README.md) for what they do, the webhook
+payload, and how to `clasp pull` / `clasp push`. The webhook token is hard-coded in all six and
+must match `SECRET_TOKEN` in `server.py`.
+
 ## Control Sheet (for users)
 
 In your **Control** tab, users only fill these columns:

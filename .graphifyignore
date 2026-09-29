@@ -1,0 +1,3 @@
+# Paths graphify should not add to the codebase graph (gitignore syntax).
+# One-off data exports and QBO backups, not source.
+kzdw_td_cleanup/
