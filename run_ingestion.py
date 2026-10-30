@@ -355,13 +355,16 @@ def get_transform_tab_state(
     tab_name: str,
     id_col_name: str,
     include_doc_id_match: bool = True,
-) -> Tuple[List[int], Dict[int, str], Set[int]]:
+    amount_col: str | None = None,
+) -> Tuple[List[int], Dict[int, str], Set[int], Dict[int, float]]:
     """Read one Transform tab once and report what it already holds.
 
-    Returns (rows_to_delete, preserved_ids, present_nos):
+    Returns (rows_to_delete, preserved_ids, present_nos, amounts_by_no):
       * rows_to_delete / preserved_ids -- the ERROR-retry context: rows flagged
         ERROR/Unbalanced, to be deleted and rebuilt under their existing document id.
       * present_nos -- every raw 'No' already written to the tab, whatever its status.
+      * amounts_by_no -- largest absolute `amount_col` value per No (empty without
+        `amount_col`). KZO compares these with raw to tell a renumbered date (step 10d).
 
     present_nos exists because rows are appended to the Transform file (step 13) *before*
     'Last Processed Row' is written back to the control sheet (step 15). A run that dies in
@@ -374,7 +377,7 @@ def get_transform_tab_state(
         # Use read_as_df to keep row positions aligned with sheet rows.
         df = gs.read_as_df(spreadsheet_url, tab_name)
         if df.empty or "No" not in df.columns:
-            return [], {}, set()
+            return [], {}, set(), {}
 
         work_df = df.copy()
         work_df["_sheet_row"] = work_df.index + 2  # +2 for header + 0-indexed DataFrame
@@ -382,9 +385,14 @@ def get_transform_tab_state(
         present_nos = {
             int(x) for x in work_df["_no"].dropna().astype(int).tolist() if int(x) > 0
         }
+        amounts_by_no = (
+            _abs_amounts_by_no(df["No"], df[amount_col])
+            if amount_col and amount_col in df.columns
+            else {}
+        )
 
         if "Remarks" not in df.columns or id_col_name not in df.columns:
-            return [], {}, present_nos
+            return [], {}, present_nos, amounts_by_no
 
         work_df["_remarks"] = work_df["Remarks"].astype(str)
         work_df["_doc_id"] = work_df[id_col_name].astype(str).str.strip()
@@ -393,7 +401,7 @@ def get_transform_tab_state(
         error_mask = work_df["_remarks"].str.contains("ERROR|Unbalance", case=False, na=False)
         bad_rows = work_df[error_mask]
         if bad_rows.empty:
-            return [], {}, present_nos
+            return [], {}, present_nos, amounts_by_no
 
         bad_ids = set()
         if include_doc_id_match:
@@ -414,7 +422,7 @@ def get_transform_tab_state(
 
         target_df = work_df[target_mask].copy()
         if target_df.empty:
-            return [], {}, present_nos
+            return [], {}, present_nos, amounts_by_no
 
         rows_to_delete = sorted(target_df["_sheet_row"].astype(int).unique().tolist(), reverse=True)
         existing_id_map = {}
@@ -428,7 +436,7 @@ def get_transform_tab_state(
             except Exception:
                 pass
 
-        return rows_to_delete, existing_id_map, present_nos
+        return rows_to_delete, existing_id_map, present_nos, amounts_by_no
     except Exception as e:
         logger.exception(f"get_transform_tab_state crashed on tab '{tab_name}': {e}")
         raise
@@ -457,6 +465,75 @@ def _already_transformed_nos(
     the intended behavior. Everything else would be a second copy under a new Ref No.
     """
     return {n for n in processing_nos if n in transformed_nos and n not in retry_nos}
+
+
+def _abs_amounts_by_no(nos: pd.Series, amounts: pd.Series) -> dict[int, float]:
+    """Largest absolute amount per raw No, the reconciler's raw-vs-transform rule.
+
+    Journal lines come in +/- pairs per raw row, so the largest line is the row's amount.
+    Blank or zero Nos and amounts that do not parse (e.g. '75,669.22' is fine, 'n/a' is not)
+    are left out.
+    """
+    work = pd.DataFrame({
+        "no": pd.to_numeric(nos.reset_index(drop=True), errors="coerce"),
+        "amt": pd.to_numeric(
+            amounts.reset_index(drop=True).astype(str).str.replace(",", "", regex=False),
+            errors="coerce",
+        ).abs(),
+    }).dropna()
+    work = work[work["no"] > 0]
+    return {int(no): float(amt) for no, amt in work.groupby("no")["amt"].max().items()}
+
+
+def _kzo_no_day(no_val: int) -> int:
+    """The date part of a KZO raw No: TEXT(date, "MDD") ahead of the 4-digit same-date count."""
+    return int(no_val) // 10000
+
+
+def _kzo_missed_nos(
+    ready_nos: set[int],
+    last_processed: int,
+    transformed_nos: set[int],
+    transform_amounts: dict[int, float],
+    raw_amounts: dict[int, float],
+) -> tuple[set[int], dict[int, tuple[int, set[int]]]]:
+    """KZO: ready rows the checkpoint already passed that the Transform file never received.
+
+    KZO's No starts with the row's date, so the checkpoint (the highest No transformed) means
+    "the latest date reached". A row for an earlier date that becomes ready after a later
+    date was transformed is below it for good. The Transform file is the record of what was
+    produced, so such a row is picked up -- unless its date looks renumbered: the No formula
+    renumbers a date when a row is inserted or deleted there, and then a missing No can be a
+    row that is already in the Transform file under its old No.
+
+    A date counts as renumbered when one of its transformed Nos no longer shows the same
+    amount in raw (or is gone from raw), with the reconciler's 0.05 tolerance. The caller
+    leaves ERROR-retry Nos out of `transform_amounts`, since those rows are being rebuilt.
+
+    Returns (missed_nos, held): held maps a date (see `_kzo_no_day`) to the first
+    mismatching transformed No and the missed Nos kept back on that date.
+    """
+    behind = {n for n in ready_nos if 0 < n <= last_processed and n not in transformed_nos}
+    held: dict[int, tuple[int, set[int]]] = {}
+    for day in sorted({_kzo_no_day(n) for n in behind}):
+        for t_no in sorted(n for n in transform_amounts if _kzo_no_day(n) == day):
+            raw_amt = raw_amounts.get(t_no)
+            if raw_amt is None or abs(raw_amt - transform_amounts[t_no]) > 0.05:
+                held[day] = (t_no, {n for n in behind if _kzo_no_day(n) == day})
+                break
+    missed = {n for n in behind if _kzo_no_day(n) not in held}
+    return missed, held
+
+
+def _kzo_held_note(held: dict[int, tuple[int, set[int]]]) -> str:
+    """'Pending Nos Note' text for the missed rows `_kzo_missed_nos` kept back."""
+    return "; ".join(
+        f"held {day // 100}/{day % 100} rows {_serialize_no_set(nos)}: No {bad_no} no longer "
+        f"matches its Transform row, so that date looks renumbered. Check the raw tab, then "
+        f"put the Nos to add in Pending Amount Nos"
+        for day, (bad_no, nos) in sorted(held.items())
+    )
+
 
 def _get_sheet_rows_for_nos(
     gs: GSheetsClient,
@@ -642,31 +719,36 @@ def process_client_control_sheet(
             deletions: Dict[str, List[int]] = {}
             retry_nos: list[int] = []
             transformed_nos: set[int] = set()
+            transform_amounts: dict[int, float] = {}  # for KZO's renumbered-date check (10d)
 
             # Retry by raw No only (avoid broad doc-id expansion).
-            d_jv, ids_jv, nos_jv = get_transform_tab_state(
-                gs, transform_url, tab_jv, "Journal No", include_doc_id_match=False
+            d_jv, ids_jv, nos_jv, amt_jv = get_transform_tab_state(
+                gs, transform_url, tab_jv, "Journal No", include_doc_id_match=False, amount_col="Amount"
             )
             if d_jv:
                 deletions[tab_jv] = d_jv
                 preserved_ids['journals'] = ids_jv
             transformed_nos |= nos_jv
 
-            d_exp, ids_exp, nos_exp = get_transform_tab_state(
-                gs, transform_url, tab_exp, "Exp Ref. No", include_doc_id_match=False
+            d_exp, ids_exp, nos_exp, amt_exp = get_transform_tab_state(
+                gs, transform_url, tab_exp, "Exp Ref. No", include_doc_id_match=False, amount_col="Expense Line Amount"
             )
             if d_exp:
                 deletions[tab_exp] = d_exp
                 preserved_ids['expenses'] = ids_exp
             transformed_nos |= nos_exp
 
-            d_tr, ids_tr, nos_tr = get_transform_tab_state(
-                gs, transform_url, tab_tr, "Ref No", include_doc_id_match=False
+            d_tr, ids_tr, nos_tr, amt_tr = get_transform_tab_state(
+                gs, transform_url, tab_tr, "Ref No", include_doc_id_match=False, amount_col="Transfer Amount"
             )
             if d_tr:
                 deletions[tab_tr] = d_tr
                 preserved_ids['transfers'] = ids_tr
             transformed_nos |= nos_tr
+
+            for tab_amounts in (amt_jv, amt_exp, amt_tr):
+                for no_val, amt in tab_amounts.items():
+                    transform_amounts[no_val] = max(amt, transform_amounts.get(no_val, 0.0))
 
             retry_nos = list(set([k for sub in preserved_ids.values() for k in sub.keys()]))
 
@@ -759,6 +841,12 @@ def process_client_control_sheet(
                 if col in raw_df.columns:
                     raw_df[col] = pd.to_numeric(raw_df[col], errors="coerce").fillna(0)
 
+            # 8b. KZO: raw amount per No for the renumbered-date check (10d), taken before the
+            #     Exclude filter so a row excluded after it was transformed still compares.
+            raw_amounts_by_no = (
+                _abs_amounts_by_no(raw_df["No"], raw_df["USD - QBO"]) if is_kzo_client else {}
+            )
+
             # 9. Exclude Rows
             before_exclude = len(raw_df)
             raw_df = raw_df[~raw_df["Check (Internal use)"].astype(str).str.contains("exclude", na=False, case=False)].copy()
@@ -837,8 +925,35 @@ def process_client_control_sheet(
                 method_non_blank
             ].copy()
 
+            # 10d. KZO ONLY: ready rows the checkpoint already passed but the Transform file
+            #      never received. KZO's No starts with the date, so transforming a later date
+            #      first leaves every earlier row that gets its method afterwards below the
+            #      checkpoint (TH Sep 2026). Rows on a date that looks renumbered are held and
+            #      named in the note instead, so a shifted No cannot post a row twice.
+            missed_df = ready_df.iloc[0:0]
+            held_count = 0
+            if is_kzo_client:
+                retry_no_set = set(retry_nos)
+                missed_nos, held = _kzo_missed_nos(
+                    ready_nos={int(x) for x in ready_df["No"].tolist()} - previous_pending_nos,
+                    last_processed=last_processed,
+                    transformed_nos=transformed_nos,
+                    transform_amounts={
+                        n: amt for n, amt in transform_amounts.items() if n not in retry_no_set
+                    },
+                    raw_amounts=raw_amounts_by_no,
+                )
+                missed_df = ready_df[ready_df["No"].isin(missed_nos)].copy()
+                if held:
+                    held_count = sum(len(nos) for _, nos in held.values())
+                    held_note = _kzo_held_note(held)
+                    logger.warning(f"   ⚠️ [{client_name}] Step 10d: {held_note}")
+                    pending_nos_note = (
+                        f"{pending_nos_note}; {held_note}" if pending_nos_note else held_note
+                    )
+
             processing_df = (
-                pd.concat([new_df, late_filled_df, retry_df])
+                pd.concat([new_df, late_filled_df, retry_df, missed_df])
                   .drop_duplicates(subset=["No"])
             )
 
@@ -852,16 +967,17 @@ def process_client_control_sheet(
                  (~no_numeric.isin(previous_pending_nos)) &
                  (~no_numeric.isin(retry_nos)) &
                  (method_non_blank & (amt_numeric != 0))).sum()
-            )
+            ) - len(missed_df) - held_count  # below the checkpoint but never transformed
             logger.info(
                 f"   🔢 [{client_name}] Step 10: Selection -> New: {len(new_df)}, "
-                f"Late-filled: {len(late_filled_df)}, Retry: {len(retry_df)} | "
-                f"Total: {len(processing_df)}"
+                f"Late-filled: {len(late_filled_df)}, Retry: {len(retry_df)}, "
+                f"Missed: {len(missed_df)} | Total: {len(processing_df)}"
             )
             logger.info(
                 f"   🔍 [{client_name}] Step 10 Detail -> No Method: {no_method_count}, "
                 f"Zero Amount(Pending): {zero_amount_count}, Ready Rows: {positive_amt_count}, "
-                f"Eligible Old & done: {eligible_old_done_count}, Last Processed Row: {last_processed}"
+                f"Eligible Old & done: {eligible_old_done_count}, Held (renumbered date): {held_count}, "
+                f"Last Processed Row: {last_processed}"
             )
             # -------------------------
 

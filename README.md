@@ -78,6 +78,10 @@ A raw row is held in `Pending Amount Nos` (not pushed to QBO) when it has a `QBO
 but `USD - QBO` is 0. Once the amount is filled in, the next run picks the row up
 automatically, even though its `No.` is already below `Last Processed Row`.
 
+Rows that had no `QBO Method` yet are not tracked here. KZO picks those up anyway once they
+are ready (see [KZO: ready rows below the checkpoint](#kzo-ready-rows-below-the-checkpoint-are-still-picked-up)).
+Other clients need their `No`s listed in `Pending Amount Nos` by hand.
+
 ### Transform stops when the raw `No` column is broken
 
 Every raw tab numbers its rows with one array formula (`ARRAYFORMULA` / `SEQUENCE`) at the top
@@ -142,7 +146,8 @@ Consequences worth knowing:
   Transform file while the checkpoint stayed high — those are silently behind the checkpoint and
   will never be rebuilt. If you delete Transform rows, lower `Last Processed Row` to the highest
   `No` you kept, then re-run. The raw-vs-transform reconciliation ("possibly skipped rows") is
-  what catches this case.
+  what catches this case. KZO is the exception: it re-creates a deleted row whose raw row is
+  still ready (see [below](#kzo-ready-rows-below-the-checkpoint-are-still-picked-up)).
 
 #### KZO: `Last Processed Row` is a live formula
 
@@ -182,6 +187,51 @@ Two things to know:
   what actually gets appended.
 
 Other clients (KZP / S5 / UMBER / KZDW) keep the plain number.
+
+#### KZO: ready rows below the checkpoint are still picked up
+
+KZO's raw `No` starts with the row's date (see [shifted `No.`](#kzo-shifted-no-when-a-row-is-inserted)),
+so `Last Processed Row` (the highest `No` in the Transform file) really means "the latest
+date reached". If a later date is transformed before an earlier date is fully categorised,
+every earlier row that gets its `QBO Import Method` afterwards sits below the checkpoint. The
+`No > Last Processed Row` rule never selected those rows, and the Step 10 log counted them as
+`Eligible Old & done`.
+
+TH Sep 2026 exposed it. The 30 Sep 06:04 run transformed the Sep 21–27 rows that had a method
+at the time (2,828 rows had none yet), including Sep 27 transfers, so the checkpoint jumped to
+`9270036`. The rest of Sep 21–26 was filled in afterwards, and the 09:03 run only added the rest
+of Sep 27. That left out 244 ready rows (240 from Sep 21–26, 4 from Sep 10). They were
+recovered by listing them in `Pending Amount Nos`.
+
+Step 10d (KZO only) now also selects **ready rows at or below the checkpoint whose `No` is not
+in the Transform file**. They are counted as `Missed` in the Step 10 log. `Pending Amount Nos`
+rows keep their own path (10b).
+
+The risk is renumbering. Inserting or deleting a raw row renumbers the later rows on that
+date, so a `No` missing from the Transform file can be a row that is already there under its
+old `No`. Before picking up a date's missed rows, `_kzo_missed_nos()` checks that every
+transformed `No` on that date still shows the same amount in raw. It uses the reconciler's rule
+(largest absolute amount per `No`, 0.05 tolerance) and skips ERROR rows that are about to be
+rebuilt. If any transformed `No` fails that check or is gone from raw, that date's missed rows
+are **held**: nothing is transformed for the date, and `Pending Nos Note` says, for example:
+
+```
+held 9/15 rows 9150101;9150102: No 9150099 no longer matches its Transform row, so that date looks renumbered. Check the raw tab, then put the Nos to add in Pending Amount Nos
+```
+
+The date is the `No`'s `MDD` prefix (`No // 10000`). Descriptions are not compared, because
+analysts edit them after transform (7 of 1,579 TH Sep rows), which would hold dates for no
+reason. The amount check misses one kind of shift: a row inserted into a run of rows that all
+have the same amount, with that same amount itself. That case still leaves QBO totals right.
+
+Things to know:
+
+- **Deleting a KZO Transform row makes it come back** on that month's next run, as long as its
+  raw row is still ready. To drop a row for good, put `exclude` in its raw
+  `Checking ( For our use only )` cell (step 9).
+- Setting an old month's Transform back to READY picks up that month's missed rows too.
+- In the Step 10 log, `Eligible Old & done` no longer counts missed or held rows, and
+  `Held (renumbered date)` counts the held ones.
 
 ### KZO source tabs (all countries)
 
