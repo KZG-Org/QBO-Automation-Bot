@@ -26,7 +26,8 @@ Volume: KZO has hundreds of lines a month. Each other company has fewer than 20.
 - Expenses, transfers, bills, invoices. Journals only.
 - Fixing a journal that is already in QBO. That stays a manual QBO edit, as for normal rows.
 - The KZO bulk menu. The month-end row is run only from its own dropdowns (user decision).
-- Rounding or auto-fixing amounts. Normal rows round to 2 decimals and fix up to 0.50; month-end
+- (Superseded 2026-10-31, see 6.2 check 5: amounts are now rounded to cents and a rounding gap
+  is moved onto the largest negative line.) Rounding or auto-fixing amounts. Normal rows round to 2 decimals and fix up to 0.50; month-end
   amounts are posted exactly as typed (user decision, see 6.2).
 
 ## 4. Anti-goals (a failure even if it "works")
@@ -169,13 +170,15 @@ each of their lines and are not copied. Other journals still go through.
 4. Class found in QBO when filled (not for S5 / UMBER). Needed because sync drops an unknown
    Class without an error (`find_id('classes', ..., warn_on_missing=False)`, `syncing.py:348`),
    and month-end Class is typed by hand, not copied from Location as on normal rows.
-5. No rounding (user decision). The bot never changes an amount.
-   - Each Amount has at most 2 decimals (QBO keeps cents only), else
-     `ERROR: Amount 11702.5197 has more than 2 decimals (row 2). Use ROUND(...,2) in the sheet`.
-     Compare with a float tolerance (`abs(x*100 - round(x*100)) < 1e-6`), so 11702.52 read as a
-     float passes.
-   - Sum of Amount = 0 to the cent (`abs(sum) < 0.005`), else
-     `ERROR: Journal does not balance (diff 0.01)`.
+5. Balance and rounding (user decision, changed 2026-10-31 after the first real run: the
+   team's amounts are revenue-ratio formulas such as 11702.517150825772, and the user does not
+   want the team to ROUND in the sheet).
+   - Sum of the **unrounded** amounts = 0 within half a cent (`abs(sum) < 0.005`), else
+     `ERROR: Journal does not balance (diff 0.01)`. A real gap is never hidden by rounding.
+   - Each line is rounded to cents, half away from zero (as Sheets displays it).
+   - If the rounded lines do not sum to 0, the gap goes onto the journal's largest negative line
+     (largest line if there is no negative one). That line's Status says
+     `Transformed <JV> (rounding: +0.01 on this line to balance)`; Transform Note lists the moves.
 6. Currency (my call, keeps normal-row behavior):
    - KZO, KZP, S5, UMBER: `Currency Code` must be blank or `USD`, else
      `ERROR: <company> journals post in USD only`. Normal rows for these always post USD.

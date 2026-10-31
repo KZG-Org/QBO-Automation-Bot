@@ -17,6 +17,7 @@ import numbers
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal
 
 import pandas as pd
 
@@ -40,7 +41,8 @@ _KNOWN_HEADERS = {h.lower(): h for h in REQUIRED_HEADERS + OPTIONAL_HEADERS + (S
 # Values compared by the "source changed during Transform" check.
 _VERIFY_COLUMNS = ("Date", "Account", "Amount")
 
-_STATUS_RE = re.compile(r"^(transformed|synced)\s+(\S+)\s*$", re.IGNORECASE)
+# "Transformed <JV>", optionally followed by a note such as "(rounding: +0.01 on this line ...)".
+_STATUS_RE = re.compile(r"^(transformed|synced)\s+(\S+)(?:\s.*)?$", re.IGNORECASE)
 _SIBLING_ERROR = "Another line in this journal has an error"
 
 
@@ -161,9 +163,27 @@ def _parse_amount(value) -> float | None:
     return -number if negative else number
 
 
-def _has_more_than_2_decimals(amount: float) -> bool:
-    cents = amount * 100
-    return abs(cents - round(cents)) >= 1e-6
+def _round_cents(amount: float) -> float:
+    """Round half away from zero, like Google Sheets shows the cell (Python's round() would
+    turn 0.125 into 0.12). repr() keeps the decimal the sheet holds, not the binary noise."""
+    return float(Decimal(repr(float(amount))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _rounded_amounts(lines: pd.DataFrame) -> tuple[dict[int, float], tuple[int, float] | None]:
+    """Each line rounded to cents, and the rounding gap moved onto the largest negative line.
+
+    Only called for a journal whose unrounded lines balance, so any gap left after rounding
+    comes from rounding alone. Returns ({sheet row: amount}, (row, amount added) or None).
+    """
+    raw = {row: _parse_amount(lines.at[row, "Amount"]) for row in lines.index}
+    rounded = {row: _round_cents(value) for row, value in raw.items()}
+    gap = round(math.fsum(rounded.values()), 2)
+    if gap == 0:
+        return rounded, None
+    negatives = [row for row, value in raw.items() if value < 0] or list(raw)
+    target = max(negatives, key=lambda row: abs(raw[row]))
+    rounded[target] = round(rounded[target] - gap, 2)
+    return rounded, (target, round(-gap, 2))
 
 
 def _fix_grp(text: str) -> str:
@@ -177,6 +197,9 @@ class MonthEndPlan:
     last_journal_no: int
     new_journal_nos: list[str] = field(default_factory=list)
     rebuilt_journal_nos: list[str] = field(default_factory=list)
+    # (journal no, sheet row, amount added) where rounding to cents left a gap that was moved
+    # onto the journal's largest negative line.
+    rounding_adjustments: list[tuple[str, int, float]] = field(default_factory=list)
     failed_journal_count: int = 0
     error_line_count: int = 0
     outside_month_count: int = 0
@@ -196,8 +219,6 @@ def _line_error(row: pd.Series, client_name: str, qbo_mappings: dict) -> str | N
         return f"Amount '{_norm_text(row['Amount'])}' is not a number"
     if amount is None or amount == 0:
         return "Missing Amount"
-    if _has_more_than_2_decimals(amount):
-        return f"Amount {_norm_text(row['Amount'])} has more than 2 decimals. Use ROUND(...,2) in the sheet"
     if not find_id_in_map(qbo_mappings.get("accounts", {}), account, allow_fuzzy=False, client_name=client_name):
         return f"Account not found: '{account}'"
     if not _is_s5_or_umber_case(client_name):
@@ -219,16 +240,17 @@ def _journal_error(lines: pd.DataFrame, client_name: str) -> str | None:
     if _is_kzdw_case(client_name):
         if lines["Currency Code"].apply(_normalize_currency_code).nunique() > 1:
             return "Mixed currencies in one journal"
+    # Checked on the unrounded amounts: a gap here is a real imbalance, not rounding.
     total = math.fsum(_parse_amount(v) for v in lines["Amount"])
     if abs(total) >= 0.005:
-        return f"Journal does not balance (diff {round(total, 2):.2f})"
+        return f"Journal does not balance (diff {_round_cents(total):.2f})"
     return None
 
 
-def _output_rows(lines: pd.DataFrame, journal_no: str, client_name: str) -> list[dict]:
+def _output_rows(lines: pd.DataFrame, journal_no: str, client_name: str, amounts: dict[int, float]) -> list[dict]:
     blank_loc = _is_s5_or_umber_case(client_name)
     rows = []
-    for _, line in lines.iterrows():
+    for sheet_row, line in lines.iterrows():
         currency = _normalize_currency_code(line["Currency Code"])
         location = "" if blank_loc else _fix_grp(_norm_text(line["Location"]))
         cls = "" if blank_loc else (_fix_grp(_norm_text(line["Class"])) or location)
@@ -238,7 +260,7 @@ def _output_rows(lines: pd.DataFrame, journal_no: str, client_name: str) -> list
             "Date": _parse_date(line["Date"]).strftime("%Y-%m-%d"),
             "Memo": _norm_text(line["Memo"]),
             "Account": _norm_text(line["Account"]),
-            "Amount": _parse_amount(line["Amount"]),
+            "Amount": amounts[sheet_row],
             "Name": _norm_text(line["Name"]),
             "Location": location,
             "Currency Code": currency,
@@ -308,6 +330,7 @@ def plan_month_end(
     out_rows: list[dict] = []
     new_nos: list[str] = []
     rebuilt_nos: list[str] = []
+    adjustments: list[tuple[str, int, float]] = []
     failed = 0
     current = start_jv
     for key, rows in sorted(groups.items(), key=lambda item: min(item[1])):
@@ -319,6 +342,7 @@ def plan_month_end(
             for row in rows:
                 status_updates[row] = f"ERROR: {line_errors[row] or journal_error or _SIBLING_ERROR}"
             continue
+        amounts, adjustment = _rounded_amounts(lines)
         if key[0] == "rebuild":
             journal_no = key[1]
             rebuilt_nos.append(journal_no)
@@ -328,7 +352,14 @@ def plan_month_end(
             new_nos.append(journal_no)
             for row in rows:
                 status_updates[row] = f"Transformed {journal_no}"
-        out_rows.extend(_output_rows(lines, journal_no, client_name))
+            if adjustment:
+                adj_row, added = adjustment
+                status_updates[adj_row] = (
+                    f"Transformed {journal_no} (rounding: {added:+.2f} on this line to balance)"
+                )
+        if adjustment:
+            adjustments.append((journal_no, adjustment[0], adjustment[1]))
+        out_rows.extend(_output_rows(lines, journal_no, client_name, amounts))
 
     # Only write what changes, so a re-run does not rewrite identical cells.
     status_updates = {
@@ -349,6 +380,7 @@ def plan_month_end(
         outside_month_count=outside,
         unknown_status_count=unknown,
         rows_to_verify=sorted(row for rows in groups.values() for row in rows),
+        rounding_adjustments=adjustments,
     )
 
 
@@ -413,9 +445,12 @@ def sync_status_updates(source: SourceTab, synced_jvs: set[str]) -> list[dict]:
     """
     updates = []
     for row in source.df.index:
-        kind, jv = parse_status(source.df.at[row, STATUS_HEADER])
+        text = _norm_text(source.df.at[row, STATUS_HEADER])
+        kind, jv = parse_status(text)
         if kind == "transformed" and jv in synced_jvs:
-            updates.append({"row": row, "col": source.status_col, "val": f"Synced {jv}"})
+            # Keep any note after the number (the rounding note stays visible after sync).
+            synced = re.sub(r"^transformed", "Synced", text, count=1, flags=re.IGNORECASE)
+            updates.append({"row": row, "col": source.status_col, "val": synced})
     return updates
 
 
@@ -431,6 +466,9 @@ def transform_note(plan: MonthEndPlan, tab_name: str, month_label: str) -> str:
         parts.append(f"{_plural(len(nos), 'journal')} ready: {span}.")
     if plan.rebuilt_journal_nos:
         parts.append(f"Rebuilt: {', '.join(plan.rebuilt_journal_nos)}.")
+    if plan.rounding_adjustments:
+        moves = ", ".join(f"{jv} {added:+.2f}" for jv, _, added in plan.rounding_adjustments)
+        parts.append(f"Rounding to cents moved {moves} (see Status).")
     if plan.failed_journal_count:
         verb = "has" if plan.failed_journal_count == 1 else "have"
         parts.append(f"{_plural(plan.failed_journal_count, 'journal')} {verb} errors: see Status in '{tab_name}'.")

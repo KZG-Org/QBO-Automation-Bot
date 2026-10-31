@@ -671,8 +671,15 @@ Transform and the note names it). `Status` belongs to the bot; if the column is 
 adds it after the last header. Each company needs its own tab: a Status with another company's
 prefix (`KZP-JV…` in a KZO run) stops Transform.
 
-- Amount: positive = debit, negative = credit. **Not rounded or adjusted**: more than 2 decimals is
-  an error (`Use ROUND(...,2) in the sheet`), and each journal must balance to the cent.
+- Amount: positive = debit, negative = credit. Formulas with long decimals are fine; nobody has to
+  ROUND in the sheet. The bot first checks the **unrounded** lines: if they do not add up to zero
+  (gap of half a cent or more), the journal is `ERROR: Journal does not balance (diff …)`. Then it
+  rounds each line to cents, half away from zero like Sheets shows it (11,702.517… → 11,702.52).
+  If rounding leaves a gap (0.01 or so), it moves it onto the journal's **largest negative line**
+  and says so on that line: `Transformed KZO-JV1418 (rounding: -0.01 on this line to balance)`,
+  plus `Rounding to cents moved …` in `Transform Note`. The note stays after sync
+  (`Synced KZO-JV1418 (rounding: …)`). Normal rows keep their own rule (round, fix up to 0.50 on
+  the last line).
 - Grouping: lines with the same Date + Memo are one journal; for KZO (and KZO Sports) also the same
   Account. A KZO entry that spans two accounts therefore fails as unbalanced.
 - Currency: KZO, KZP, S5, UMBER post USD only. KZDW / TINDERPAY: one currency per journal; a

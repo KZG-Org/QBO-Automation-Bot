@@ -93,6 +93,10 @@ class ParseStatusTests(unittest.TestCase):
     def test_other_text_is_unknown(self):
         self.assertEqual(parse_status("done"), ("unknown", None))
 
+    def test_rounding_note_after_the_number_is_allowed(self):
+        self.assertEqual(parse_status("Transformed KZO-JV1418 (rounding: +0.01 on this line to balance)"),
+                         ("transformed", "KZO-JV1418"))
+
 
 class ReadSourceTabTests(unittest.TestCase):
     def test_rows_keep_sheet_row_numbers_across_blank_rows(self):
@@ -176,12 +180,43 @@ class PlanMonthEndTests(unittest.TestCase):
         result = plan([line(amount=10, cls="Nowhere"), line(amount=-10)])
         self.assertEqual(result.status_updates[2], "ERROR: Class not found: 'Nowhere'")
 
-    def test_more_than_two_decimals_is_stopped(self):
-        result = plan([line(amount=11702.5197), line(amount=-11702.5197, location="PK")])
-        self.assertEqual(
-            result.status_updates[2],
-            "ERROR: Amount 11702.5197 has more than 2 decimals. Use ROUND(...,2) in the sheet",
-        )
+    def test_formula_amounts_are_rounded_to_cents(self):
+        # The team's real tab on 2026-10-31: revenue-ratio formulas with long decimals.
+        raw = [("TH", 11702.517150825772), ("PK", 423.6404377840696), ("PH", 3540.888102056954),
+               ("PE", 72.69351936753716), ("MX", 579.523053169697), ("GROUP", -17167.88),
+               ("CO", 65.99757372188925), ("BR", 80.16469252658177), ("BD", 702.4554705474958)]
+        result = plan([line(amount=amt, location=loc) for loc, amt in raw])
+        self.assertEqual(result.new_journal_nos, ["KZO-JV1418"])
+        self.assertEqual(list(result.journals["Amount"]), [amt for _, amt in KZO_RECLASS])
+        self.assertEqual(result.status_updates, {r: "Transformed KZO-JV1418" for r in range(2, 11)})
+        self.assertEqual(result.rounding_adjustments, [])
+
+    def test_rounding_gap_goes_on_the_largest_negative_line_and_is_reported(self):
+        rows = [line(amount=0.333), line(amount=0.333, location="PK"), line(amount=0.334, location="PH"),
+                line(amount=-0.4, location="MX"), line(amount=-0.6, location="GROUP")]
+        result = plan(rows)
+        # 0.33 + 0.33 + 0.33 - 0.40 - 0.60 = -0.01, so the GROUP line (largest negative) takes +0.01.
+        self.assertEqual(list(result.journals["Amount"]), [0.33, 0.33, 0.33, -0.4, -0.59])
+        self.assertEqual(result.status_updates[6],
+                         "Transformed KZO-JV1418 (rounding: +0.01 on this line to balance)")
+        self.assertEqual(result.status_updates[5], "Transformed KZO-JV1418")
+        self.assertEqual(result.rounding_adjustments, [("KZO-JV1418", 6, 0.01)])
+
+    def test_rounding_is_half_up_like_google_sheets(self):
+        # Python's round() would give 0.12 (banker's rounding); Sheets shows 0.13.
+        result = plan([line(amount=0.125), line(amount=0.875, location="PK"), line(amount=-1.0, location="GROUP")])
+        self.assertEqual(list(result.journals["Amount"]), [0.13, 0.88, -1.01])
+
+    def test_a_real_imbalance_is_not_hidden_by_rounding(self):
+        # Unrounded lines off by 0.006 (shown 10.01 vs -10.00): a real gap, not rounding noise,
+        # so it is not moved onto the negative line.
+        result = plan([line(amount=10.006), line(amount=-10.0, location="PK")])
+        self.assertTrue(result.journals.empty)
+        self.assertEqual(result.status_updates[2], "ERROR: Journal does not balance (diff 0.01)")
+
+    def test_sub_cent_noise_in_the_unrounded_lines_is_not_an_error(self):
+        result = plan([line(amount=10.004), line(amount=-10.0, location="PK")])
+        self.assertEqual(list(result.journals["Amount"]), [10.0, -10.0])
 
     def test_unbalanced_journal_shows_the_difference(self):
         result = plan([line(amount=10.01), line(amount=-10, location="PK")])
@@ -278,6 +313,12 @@ class TransformNoteTests(unittest.TestCase):
         self.assertIn("1 journal ready: KZO-JV1418.", note)
         self.assertIn("1 journal has errors: see Status in 'Month-end JV_test'.", note)
         self.assertIn("1 line dated outside Oct 26 left for later.", note)
+
+    def test_note_reports_rounding_moves(self):
+        rows = [line(amount=0.333), line(amount=0.333, location="PK"), line(amount=0.334, location="PH"),
+                line(amount=-1.0, location="GROUP")]
+        note = transform_note(plan(rows), "Month-end JV_test", "Oct 26")
+        self.assertIn("Rounding to cents moved KZO-JV1418 +0.01 (see Status).", note)
 
 
 CTRL_COLUMNS = [
@@ -624,6 +665,13 @@ class SyncHelperTests(unittest.TestCase):
         by_row = {u["row"]: u["val"] for u in updates}
         self.assertEqual(by_row, {r: "Synced KZO-JV1418" for r in range(2, 11)})
         self.assertEqual({u["col"] for u in updates}, {9})
+
+    def test_rounding_note_is_kept_when_marked_synced(self):
+        from src.logic.month_end import sync_status_updates
+        note = "(rounding: +0.01 on this line to balance)"
+        grid = [HEADER, line(amount=1, status=f"Transformed KZO-JV1418 {note}")]
+        updates = sync_status_updates(read_source_tab(grid), {"KZO-JV1418"})
+        self.assertEqual(updates[0]["val"], f"Synced KZO-JV1418 {note}")
 
     def test_journals_already_synced_in_the_tab(self):
         from src.logic.month_end import synced_journal_nos
