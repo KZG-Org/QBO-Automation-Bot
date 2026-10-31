@@ -680,14 +680,20 @@ not copy), or `Sample - Journals` if that tab does not exist. Lines have a blank
 `Remarks` = `Ready to sync`. Journal numbers continue the client's normal sequence. Order, so a
 stopped run never duplicates:
 
-1. Drop every journal in the tab that has an `ERROR` remark (it is rebuilt from the source).
-2. Read the source, group, check, number. Re-read; if any used row moved or changed, stop
+1. Read the Transform tab and the source. A failed read (a 429, a timeout) stops here: it must not
+   look like "no tab yet", or every journal not synced yet would be copied again. If the source
+   has no `Status` column but the Transform tab already has journals, stop: every line would look
+   new and the month would be posted again.
+2. Drop every journal in the tab that has an `ERROR` remark (it is rebuilt from the source).
+3. Group, check, number. Re-read the source; if any used row moved or changed, stop
    (`the tab changed during Transform`).
-3. Save `Last Journal No`.
-4. Write `Status`: `Transformed KZO-JV1418`, or `ERROR: <reason>` on every line of a failed
+4. Save `Last Journal No`. From here the numbers are taken: any later failure still hands them
+   on, so the next row of the same run starts after them.
+5. Write `Status`: `Transformed KZO-JV1418`, or `ERROR: <reason>` on every line of a failed
    journal. If the bot cannot write (no **Editor** access on the source file), stop; nothing is
    copied.
-5. Append the good journals.
+6. Append the good journals. If this fails, run Transform again: the journals are rebuilt under
+   the same numbers.
 
 Lines with `Status` blank or `ERROR…` are new. `Transformed <JV>` whose journal is missing from the
 tab is rebuilt under the **same** number; `Synced <JV>` is never read again. `Transform Note` sums
@@ -695,18 +701,27 @@ it up (journals ready, journals with errors, lines left for another month). `QBO
 `ERROR` while any line has an error, which blocks SYNC NOW until it is fixed.
 
 **Sync.** Posts the tab like any Journals tab, with one extra check: a number that is already in
-QBO is skipped as "already synced" only if the QBO journal has the same date and total. Otherwise
-the lines get `ERROR: <JV> is already used in QBO by a different journal`, `QBO Journal` =
-`SYNC FAIL`, and the source Status says to run Transform, which gives those lines a new number.
-Afterwards the source Status of posted journals becomes `Synced <JV>`.
+QBO is skipped as "already synced" only if that QBO journal has the same date and memo
+(`PrivateNote`, the first line's Memo). Amounts are not compared, so an edited rebuild of a journal
+that is already posted is skipped, never posted twice. Otherwise the lines get
+`ERROR: <JV> is already used in QBO by a different journal` and `QBO Journal` = `SYNC FAIL`.
+Sync never writes `ERROR` to the source (an ERROR line would get a new number and could post
+twice); afterwards only posted journals change to `Synced <JV>` in the source.
+
+To clear a clash, open that number in QBO:
+- A different journal uses it: clear the `Status` of these lines (the one time you may), then run
+  Transform. They get a new number.
+- It is this journal (its memo or date was changed after posting): fix QBO by hand if needed, then
+  type `Synced <JV>` in `Status` for these lines.
 
 **Reconcile.** QBO check only; there is no raw `No` to compare.
 
 **Rules for the team**
 
-- Never type in or clear `Status`. A cleared `Transformed` line looks new and makes a second
-  journal. To redo a journal that is not synced yet, edit the source lines and put `ERROR` in its
-  `Remarks` in the Transform tab, then run Transform. A synced journal is fixed in QBO by hand.
+- Never type in or clear `Status`, except to clear a clash (above). A cleared `Transformed` line
+  looks new and makes a second journal. Never delete the `Status` column. To redo a journal that is
+  not synced yet, edit the source lines and put `ERROR` in its `Remarks` in the Transform tab, then
+  run Transform. A synced journal is fixed in QBO by hand.
 - Do not create a Month-end JV row for a month SaaSant already posted.
 - The bot's Google account needs **Editor** access on every file that holds a month-end tab.
 

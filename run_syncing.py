@@ -220,7 +220,7 @@ def _update_row_status_and_id(gs, spreadsheet_url, tab_name, updates: list, col_
 
     gs.batch_update_cells(spreadsheet_url, tab_name, batch_payload)
 
-def _write_back_month_end_status(gs, row: pd.Series, synced_jvs: set[str], clash_jvs: set[str]):
+def _write_back_month_end_status(gs, row: pd.Series, synced_jvs: set[str]):
     """Month-end rows: set the source Status of posted journals to 'Synced <JV>'.
 
     Never fatal: QBO already holds the journals, and the next sync writes it again because
@@ -230,7 +230,7 @@ def _write_back_month_end_status(gs, row: pd.Series, synced_jvs: set[str], clash
     tab_name = str(row.get(settings.CTRL_COL_TAB_NAME, "")).strip()
     try:
         source = read_source_tab(gs.read_values(source_url, tab_name, value_render_option="UNFORMATTED_VALUE"))
-        updates = sync_status_updates(source, synced_jvs, clash_jvs)
+        updates = sync_status_updates(source, synced_jvs)
         if updates:
             gs.batch_update_cells(source_url, tab_name, updates)
             logger.info(f"   ✅ Month-end: updated Status on {len(updates)} source line(s) in '{tab_name}'.")
@@ -326,7 +326,7 @@ def process_client_sync(
                     # same journal; otherwise the journal would be lost without an error.
                     if is_month_end and existing_docs:
                         clash_jvs = find_number_clashes(
-                            to_sync, existing_docs, sync_engine.get_journal_totals(list(existing_docs))
+                            to_sync, existing_docs, sync_engine.get_journal_details(list(existing_docs))
                         )
                     updater = AsyncSheetUpdater(gs, transform_url, tab_jv, col_ctx=col_ctx, batch_size=BATCH_SIZE)
                     section_fail = False
@@ -375,7 +375,7 @@ def process_client_sync(
                     jv_status = "SYNC FAIL" if section_fail else "SYNCED"
 
             if is_month_end and not df_jv.empty:
-                _write_back_month_end_status(gs, row, synced_journal_nos(df_jv) | posted_jvs, clash_jvs)
+                _write_back_month_end_status(gs, row, synced_journal_nos(df_jv) | posted_jvs)
         except Exception as e:
             logger.error(f"   ❌ Journal Sync Fail: {e}")
             has_error = True

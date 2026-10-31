@@ -293,11 +293,23 @@ def _gs(source_reads, transform_values=None, titles=("JOBS CONTROL", "Sample - J
     def read_values(url, tab, value_render_option="FORMATTED_VALUE"):
         if url == SOURCE:
             return reads.pop(0) if len(reads) > 1 else reads[0]
-        return transform_values or []
+        return []
 
     gs.read_values.side_effect = read_values
+    # The Transform tab is read strictly: None = tab missing, an error is raised, not swallowed.
+    gs.read_tab_values.side_effect = lambda url, tab, value_render_option="FORMATTED_VALUE": transform_values
     gs.worksheet_titles.return_value = list(titles)
     return gs
+
+
+def _control_updates_for(gs, row_num):
+    merged = {}
+    for c in gs.batch_update_cells.call_args_list:
+        if c.args[0] == "CTRL":
+            for u in c.args[2]:
+                if u["row"] == row_num:
+                    merged[CTRL_COLUMNS[u["col"] - 1]] = u["val"]
+    return merged
 
 
 def _run(gs, ctrl=None, start_jv=1417):
@@ -398,6 +410,34 @@ class ProcessMonthEndRowTests(unittest.TestCase):
         self.assertEqual(updates["Transform"], "ERROR")
         self.assertIn("row 3", updates["Transform Note"])
 
+    def test_unreadable_transform_tab_stops_before_any_write(self):
+        # A 429 on the Transform tab must not look like "no tab yet": every journal not yet
+        # synced would be copied a second time and posted with doubled lines.
+        gs = _gs([self.GRID])
+        gs.read_tab_values.side_effect = RuntimeError("APIError 429: Quota exceeded")
+        self.assertEqual(_run(gs), 1417)
+        self.assertFalse(any(c.args[0] == SOURCE for c in gs.batch_update_cells.call_args_list))
+        gs.append_or_create_df.assert_not_called()
+        gs.delete_rows.assert_not_called()
+        updates = _control_updates(gs)
+        self.assertNotIn("Last Journal No", updates)
+        self.assertEqual(updates["Transform"], "ERROR")
+        self.assertIn("could not read", updates["Transform Note"])
+
+    def test_lost_status_column_with_journals_in_the_tab_stops(self):
+        # Without Status every line looks new: the whole month would get new numbers and post again.
+        tab = [["No", "Journal No", "Date", "Memo", "Account", "Amount", "Remarks"],
+               ["", "KZO-JV1418", "2026-10-31", MEMO, "AI Expenses", "1", "Synced at 2026-10-31"]]
+        grid = [HEADER[:-1]] + [r[:-1] for r in reclass_lines()]
+        gs = _gs([grid], transform_values=tab)
+        self.assertEqual(_run(gs), 1417)
+        gs.update_cell.assert_not_called()
+        self.assertFalse(any(c.args[0] == SOURCE for c in gs.batch_update_cells.call_args_list))
+        gs.append_or_create_df.assert_not_called()
+        updates = _control_updates(gs)
+        self.assertEqual(updates["Transform"], "ERROR")
+        self.assertIn("Status column is missing", updates["Transform Note"])
+
     def test_journal_that_failed_at_sync_is_rebuilt_under_its_number(self):
         tab = [["No", "Journal No", "Date", "Memo", "Account", "Amount", "Remarks"],
                ["", "KZO-JV1400", "2026-10-31", MEMO, "AI Expenses", "1", "ERROR: QBO 400"],
@@ -411,9 +451,8 @@ class ProcessMonthEndRowTests(unittest.TestCase):
 class ControlSheetRunTests(unittest.TestCase):
     """The real per-client loop, with Sheets and QBO stubbed."""
 
-    def _run_control_sheet(self, ctrl, grid):
+    def _run_control_sheet(self, ctrl, grid, append=None):
         from unittest.mock import MagicMock, patch
-        from config import settings
         from run_ingestion import process_client_control_sheet
 
         gs = MagicMock()
@@ -422,6 +461,9 @@ class ControlSheetRunTests(unittest.TestCase):
         gs.read_values.side_effect = lambda url, tab, value_render_option="FORMATTED_VALUE": (
             grid if url == SOURCE else []
         )
+        gs.read_tab_values.return_value = None  # no Transform tab yet
+        if append:
+            gs.append_or_create_df.side_effect = append
         qbo = MagicMock()
         qbo.get_max_journal_number.return_value = 1371
         with patch("run_ingestion.QBOSync") as sync_cls:
@@ -449,6 +491,31 @@ class ControlSheetRunTests(unittest.TestCase):
         self.assertEqual(tabs[TRANSFORM], "Month-end JV Oct 26 - Journals")
         self.assertEqual(tabs[TRANSFORM + "2"], "Month-end JV Nov 26 - Journals")
 
+    def test_failure_after_numbering_still_moves_the_counter_on(self):
+        # Oct numbers KZO-JV1418 and writes its Status, then its Transform write fails. The Nov
+        # row in the same run must not take 1418 again.
+        nov_30 = (pd.Timestamp("2026-11-30") - pd.Timestamp("1899-12-30")).days
+        nov = [line(date=nov_30, memo="Nov close", amount=amt, location=loc) for loc, amt in KZO_RECLASS]
+        base = {"Country": "Month-end JV", "Source File": SOURCE, "Tab Name": TAB, "Transform": "READY"}
+        ctrl = pd.DataFrame([
+            {"Country": "TH", "Month": "2026-10-01", "Transform": "DONE", "Last Journal No": 1417},
+            dict(base, Month="2026-10-01", **{"Transform File": TRANSFORM}),
+            dict(base, Month="2026-11-01", **{"Transform File": TRANSFORM + "2"}),
+        ], columns=CTRL_COLUMNS).fillna("")
+
+        def append(url, tab, df, **kwargs):
+            if url == TRANSFORM:
+                raise RuntimeError("APIError 503: backend error")
+
+        gs = self._run_control_sheet(ctrl, [HEADER] + reclass_lines() + nov, append=append)
+
+        nov_call = next(c for c in gs.append_or_create_df.call_args_list if c.args[0] == TRANSFORM + "2")
+        self.assertEqual(set(nov_call.args[2]["Journal No"]), {"KZO-JV1419"})
+        oct_updates = _control_updates_for(gs, 3)
+        self.assertEqual(oct_updates["Last Journal No"], "1418")
+        self.assertEqual(oct_updates["Transform"], "ERROR")
+        self.assertIn("Run Transform again", oct_updates["Transform Note"])
+
     def test_month_end_row_skips_the_raw_pipeline(self):
         from unittest.mock import patch
         ctrl = pd.DataFrame([{"Country": "Month-end JV", "Source File": SOURCE, "Tab Name": TAB,
@@ -470,23 +537,27 @@ def _tab_lines(jv, amounts, remarks="Ready to sync", date="2026-10-31"):
 
 
 class SyncHelperTests(unittest.TestCase):
-    def test_same_date_and_total_is_not_a_clash(self):
+    def test_same_date_and_memo_is_the_same_journal(self):
+        # Matched on what push_journal writes (TxnDate, PrivateNote = first line's Memo), not on
+        # the total: an edited rebuild of a posted journal is still the same journal, so it is
+        # skipped, never re-posted under a new number.
         from src.logic.month_end import find_number_clashes
         to_sync = pd.DataFrame(_tab_lines("KZO-JV1418", [100.0, 50.5, -150.5]))
-        qbo = {"KZO-JV1418": [("2026-10-31", 150.5)]}
+        qbo = {"KZO-JV1418": [("2026-10-31", "  " + MEMO.upper() + " ")]}
         self.assertEqual(find_number_clashes(to_sync, {"KZO-JV1418"}, qbo), set())
 
-    def test_different_total_or_date_is_a_clash(self):
+    def test_different_memo_or_date_is_a_clash(self):
         from src.logic.month_end import find_number_clashes
         to_sync = pd.DataFrame(_tab_lines("KZO-JV1418", [100.0, -100.0]) + _tab_lines("KZO-JV1419", [5.0, -5.0]))
-        qbo = {"KZO-JV1418": [("2026-10-31", 7929.20)], "KZO-JV1419": [("2026-10-30", 5.0)]}
+        qbo = {"KZO-JV1418": [("2026-10-31", "Received from Gpay-Native XOJILI")],
+               "KZO-JV1419": [("2026-10-30", MEMO)]}
         self.assertEqual(find_number_clashes(to_sync, {"KZO-JV1418", "KZO-JV1419"}, qbo),
                          {"KZO-JV1418", "KZO-JV1419"})
 
     def test_one_matching_record_among_duplicates_is_enough(self):
         from src.logic.month_end import find_number_clashes
         to_sync = pd.DataFrame(_tab_lines("KZO-JV1418", [100.0, -100.0]))
-        qbo = {"KZO-JV1418": [("2026-09-30", 1.0), ("2026-10-31", 100.0)]}
+        qbo = {"KZO-JV1418": [("2026-09-30", "other"), ("2026-10-31", MEMO)]}
         self.assertEqual(find_number_clashes(to_sync, {"KZO-JV1418"}, qbo), set())
 
     def test_unknown_qbo_details_fall_back_to_todays_skip(self):
@@ -495,17 +566,16 @@ class SyncHelperTests(unittest.TestCase):
         to_sync = pd.DataFrame(_tab_lines("KZO-JV1418", [100.0, -100.0]))
         self.assertEqual(find_number_clashes(to_sync, {"KZO-JV1418"}, {}), set())
 
-    def test_source_updates_mark_synced_and_clashed_lines(self):
+    def test_source_updates_mark_only_posted_journals(self):
+        # A clashed journal keeps 'Transformed <JV>' in the source: sync never writes ERROR there
+        # (spec 6.6), so nothing renumbers it without a person deciding.
         from src.logic.month_end import sync_status_updates
         grid = ([HEADER] + reclass_lines(status="Transformed KZO-JV1418")
                 + [line(memo="b", amount=1, status="Transformed KZO-JV1419")]
                 + [line(memo="c", amount=1, status="Synced KZO-JV1300")])
-        updates = sync_status_updates(read_source_tab(grid), {"KZO-JV1418", "KZO-JV1300"}, {"KZO-JV1419"})
+        updates = sync_status_updates(read_source_tab(grid), {"KZO-JV1418", "KZO-JV1300"})
         by_row = {u["row"]: u["val"] for u in updates}
-        self.assertEqual({r: by_row[r] for r in range(2, 11)}, {r: "Synced KZO-JV1418" for r in range(2, 11)})
-        self.assertEqual(by_row[11], "ERROR: KZO-JV1419 is already used in QBO by a different journal. "
-                                     "Run Transform to give it a new number.")
-        self.assertNotIn(12, by_row)
+        self.assertEqual(by_row, {r: "Synced KZO-JV1418" for r in range(2, 11)})
         self.assertEqual({u["col"] for u in updates}, {9})
 
     def test_journals_already_synced_in_the_tab(self):
@@ -515,24 +585,26 @@ class SyncHelperTests(unittest.TestCase):
                           + _tab_lines("KZO-JV1402", [1, -1]))
         self.assertEqual(synced_journal_nos(df), {"KZO-JV1400", "KZO-JV1401"})
 
-    def test_get_journal_totals_reads_date_and_total(self):
+    def test_get_journal_details_reads_date_and_memo(self):
         from unittest.mock import MagicMock
         from src.logic.syncing import QBOSync
         engine = QBOSync.__new__(QBOSync)
         engine.client = MagicMock()
         engine.client.query.return_value = [
-            {"DocNumber": "KZO-JV1418", "TxnDate": "2026-10-31", "TotalAmt": 17167.88},
-            {"DocNumber": "KZO-JV1418", "TxnDate": "2026-09-30", "TotalAmt": 5.0},
+            {"DocNumber": "KZO-JV1418", "TxnDate": "2026-10-31", "PrivateNote": MEMO},
+            {"DocNumber": "KZO-JV1418", "TxnDate": "2026-09-30"},  # no memo in QBO
         ]
-        totals = engine.get_journal_totals(["KZO-JV1418"])
-        self.assertEqual(totals, {"KZO-JV1418": [("2026-10-31", 17167.88), ("2026-09-30", 5.0)]})
-        self.assertIn("FROM JournalEntry WHERE DocNumber IN ('KZO-JV1418')", engine.client.query.call_args.args[0])
+        details = engine.get_journal_details(["KZO-JV1418"])
+        self.assertEqual(details, {"KZO-JV1418": [("2026-10-31", MEMO), ("2026-09-30", "")]})
+        query = engine.client.query.call_args.args[0]
+        self.assertIn("SELECT DocNumber, TxnDate, PrivateNote FROM JournalEntry", query)
+        self.assertIn("WHERE DocNumber IN ('KZO-JV1418')", query)
 
 
 class ProcessClientSyncTests(unittest.TestCase):
     """run_syncing.process_client_sync with Sheets and QBO stubbed."""
 
-    def _sync(self, country, tab_df, existing, qbo_totals):
+    def _sync(self, country, tab_df, existing, qbo_details):
         from unittest.mock import MagicMock, patch
         from run_syncing import process_client_sync
 
@@ -553,7 +625,7 @@ class ProcessClientSyncTests(unittest.TestCase):
                 patch("run_syncing._throttle_qbo_call"):
             engine = sync_cls.return_value
             engine.get_existing_duplicates.return_value = set(existing)
-            engine.get_journal_totals.return_value = qbo_totals
+            engine.get_journal_details.return_value = qbo_details
             engine.push_journal.return_value = {"JournalEntry": {"Id": "77"}}
             engine.build_qbo_url.return_value = "link"
             process_client_sync(gs, MagicMock(), "CTRL", "KZO", "realm")
@@ -569,21 +641,20 @@ class ProcessClientSyncTests(unittest.TestCase):
                               + _tab_lines("KZO-JV1400", [1.0, -1.0]))
         engine, remarks, source_writes, control = self._sync(
             "Month-end JV", tab_df, existing={"KZO-JV1400"},
-            qbo_totals={"KZO-JV1400": [("2026-10-31", 7929.20)]},
+            qbo_details={"KZO-JV1400": [("2026-10-31", "Received from Gpay-Native XOJILI")]},
         )
         engine.push_journal.assert_called_once()
         self.assertEqual(engine.push_journal.call_args.args[0], "KZO-JV1418")
         self.assertEqual(remarks["KZO-JV1400"], {"ERROR: KZO-JV1400 is already used in QBO by a different journal"})
-        self.assertEqual({source_writes[r] for r in range(2, 11)}, {"Synced KZO-JV1418"})
-        self.assertTrue(source_writes[11].startswith("ERROR: KZO-JV1400 is already used"))
+        self.assertEqual(source_writes, {r: "Synced KZO-JV1418" for r in range(2, 11)})
         self.assertEqual(control["QBO Journal"], "SYNC FAIL")
         self.assertEqual(control["QBO Sync"], "PARTIAL ERROR")
 
-    def test_month_end_journal_already_in_qbo_with_same_total_is_marked_synced(self):
+    def test_month_end_journal_already_in_qbo_with_same_date_and_memo_is_marked_synced(self):
         tab_df = pd.DataFrame(_tab_lines("KZO-JV1400", [1.0, -1.0]))
         engine, remarks, source_writes, control = self._sync(
             "Month-end JV", tab_df, existing={"KZO-JV1400"},
-            qbo_totals={"KZO-JV1400": [("2026-10-31", 1.0)]},
+            qbo_details={"KZO-JV1400": [("2026-10-31", MEMO)]},
         )
         engine.push_journal.assert_not_called()
         self.assertTrue(all(s.startswith("Skipper") for s in remarks["KZO-JV1400"]))
@@ -593,9 +664,9 @@ class ProcessClientSyncTests(unittest.TestCase):
     def test_normal_rows_keep_todays_sync(self):
         tab_df = pd.DataFrame(_tab_lines("KZO-JV1400", [1.0, -1.0]))
         engine, remarks, source_writes, _ = self._sync(
-            "TH", tab_df, existing={"KZO-JV1400"}, qbo_totals={"KZO-JV1400": [("2026-01-01", 9.0)]},
+            "TH", tab_df, existing={"KZO-JV1400"}, qbo_details={"KZO-JV1400": [("2026-01-01", "x")]},
         )
-        engine.get_journal_totals.assert_not_called()
+        engine.get_journal_details.assert_not_called()
         self.assertTrue(all(s.startswith("Skipper") for s in remarks["KZO-JV1400"]))
         self.assertEqual(source_writes, {})
 
@@ -640,6 +711,36 @@ def _control_updates_sync(gs):
             for u in c.args[2]:
                 merged[cols[u["col"] - 1]] = u["val"]
     return merged
+
+
+class ReadTabValuesTests(unittest.TestCase):
+    def _client(self, worksheet):
+        from unittest.mock import MagicMock
+        from src.connectors.gsheets_client import GSheetsClient
+        client = GSheetsClient.__new__(GSheetsClient)
+        sheet = MagicMock()
+        sheet.worksheet.side_effect = worksheet
+        client.open = MagicMock(return_value=sheet)
+        return client
+
+    def test_missing_tab_is_none(self):
+        import gspread
+
+        def worksheet(name):
+            raise gspread.exceptions.WorksheetNotFound(name)
+        self.assertIsNone(self._client(worksheet).read_tab_values("url", "tab"))
+
+    def test_other_errors_are_raised_not_hidden(self):
+        def worksheet(name):
+            raise RuntimeError("connection reset")
+        with self.assertRaises(RuntimeError):
+            self._client(worksheet).read_tab_values("url", "tab")
+
+    def test_existing_tab_returns_its_grid(self):
+        from unittest.mock import MagicMock
+        ws = MagicMock()
+        ws.get_all_values.return_value = [["No", "Journal No"]]
+        self.assertEqual(self._client(lambda name: ws).read_tab_values("url", "tab"), [["No", "Journal No"]])
 
 
 class ReserveJournalNumbersTests(unittest.TestCase):

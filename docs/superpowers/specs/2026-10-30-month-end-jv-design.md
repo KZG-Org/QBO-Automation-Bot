@@ -220,6 +220,10 @@ month-end tab`.
 
 ### 6.5 Transform order (prevents duplicates)
 
+0. (Added after the final review.) Reads that decide what is written are strict: a failed read
+   of the Transform tab stops the row instead of counting as "no tab". A source with no `Status`
+   header while the Transform tab already has journals stops the row. After step 4b nothing
+   raises: any later failure stops the row and still returns the reserved number.
 1. Read the Transform tab. Delete every line of any journal whose `Remarks` contains `ERROR`
    (sync failure or a user-flagged rebuild). This is the same "ERROR in Remarks → rebuild under
    the same number" rule normal rows use.
@@ -247,9 +251,12 @@ New for month-end rows only:
   marks every line `Skipper (Already synced ...)` and reports `SYNCED` without comparing anything
   (`run_syncing.py:299-303`). If two different journals ever share a number, the second one is
   never posted and nobody sees an error. For month-end rows, before skipping, compare the QBO
-  journal's date and total debit with the sheet journal. Same → skip as today. Different → line
-  `Remarks` = `ERROR: <JV> is already used in QBO by a different journal`, `QBO Journal` =
-  `SYNC FAIL`. Normal rows keep today's behavior.
+  journal's date and memo (`PrivateNote` = first line's Memo) with the sheet journal. Same → skip
+  as today. Different → line `Remarks` = `ERROR: <JV> is already used in QBO by a different
+  journal`, `QBO Journal` = `SYNC FAIL`; the source Status is not touched. Normal rows keep
+  today's behavior. (Changed after the final review: the first build compared totals and wrote
+  ERROR to the source, which could renumber and re-post an edited journal that was already in
+  QBO, and relied on JournalEntry `TotalAmt`, which this repo never verified.)
 - **Write back to source.** After the journal section, for each JV that ended as `Synced at ...`
   or a confirmed `Skipper (Already synced ...)`, set source lines with `Status` =
   `Transformed <JV>` to `Synced <JV>` in one batch. A failure here is logged and noted, not fatal; it does not change

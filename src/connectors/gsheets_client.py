@@ -153,6 +153,20 @@ class GSheetsClient:
         return [ws.title for ws in self.open(spreadsheet_url_or_id).worksheets()]
 
     @retry_with_backoff()
+    def read_tab_values(self, spreadsheet_url_or_id: str, tab_name: str, value_render_option: str = 'FORMATTED_VALUE') -> list[list] | None:
+        """Like read_values, but only a missing tab returns None; every other error is raised.
+
+        read_values turns any failure (a 429 included) into [], which is fine for a tab that is
+        only shown, not for a tab whose contents decide what must not be written twice.
+        """
+        sh = self.open(spreadsheet_url_or_id)
+        try:
+            ws = sh.worksheet(tab_name)
+        except gspread.exceptions.WorksheetNotFound:
+            return None
+        return ws.get_all_values(value_render_option=value_render_option)
+
+    @retry_with_backoff()
     def read_values(self, spreadsheet_url_or_id: str, tab_name: str, value_render_option: str = 'FORMATTED_VALUE') -> list[list]:
         """Raw cell grid of a tab, as a list of rows. [] when the tab is missing.
 

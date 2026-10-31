@@ -21,7 +21,7 @@ from datetime import datetime
 import pandas as pd
 
 from config import settings
-from src.logic.syncing import _parse_amount as _parse_sync_amount, _parse_date_yyyy_mm_dd
+from src.logic.syncing import _parse_date_yyyy_mm_dd
 from src.logic.transformer import (
     _build_id_prefixes,
     _is_kzdw_case,
@@ -353,28 +353,30 @@ def changed_rows(before: SourceTab, after: SourceTab, rows: list[int]) -> list[i
 # ---- Sync ----
 
 CLASH_REMARK = "ERROR: {jv} is already used in QBO by a different journal"
-CLASH_STATUS = CLASH_REMARK + ". Run Transform to give it a new number."
 
 
 def find_number_clashes(
-    to_sync: pd.DataFrame, existing_docs: set[str], qbo_journals: dict[str, list[tuple[str, float]]]
+    to_sync: pd.DataFrame, existing_docs: set[str], qbo_journals: dict[str, list[tuple[str, str]]]
 ) -> set[str]:
     """Journal numbers already in QBO whose QBO journal is a different one.
 
     Sync skips a number that is already in QBO as "already synced". That is right when it is
     this same journal (an earlier sync that did not get to write its status), and silently
-    loses the journal when the number was taken by another one. Same journal = same date and
-    same total debit. Dates and amounts are read the way push_journal reads them. A number
-    whose QBO details could not be fetched is not judged, so it keeps today's skip.
+    loses the journal when the number was taken by another one. Same journal = same TxnDate
+    and same memo (push_journal writes the first line's Memo as PrivateNote). Amounts are not
+    compared: an edited rebuild of a journal that is already posted is still that journal and
+    must be skipped, not posted again. A number whose QBO details could not be fetched is not
+    judged, so it keeps today's skip.
     """
     clashes = set()
     for jv, group in to_sync.groupby("Journal No"):
         jv = str(jv)
         if jv not in existing_docs or jv not in qbo_journals:
             continue
-        date = _parse_date_yyyy_mm_dd(group.iloc[0]["Date"])
-        total = math.fsum(a for a in (_parse_sync_amount(v) for v in group["Amount"]) if a > 0)
-        if not any(d == date and abs(t - total) < 0.005 for d, t in qbo_journals[jv]):
+        first = group.iloc[0]
+        date = _parse_date_yyyy_mm_dd(first["Date"])
+        memo = _norm_text(first.get("Memo", "")).lower()
+        if not any(d == date and _norm_text(note).lower() == memo for d, note in qbo_journals[jv]):
             clashes.add(jv)
     return clashes
 
@@ -388,16 +390,17 @@ def synced_journal_nos(tab_df: pd.DataFrame) -> set[str]:
     return {str(jv) for jv in tab_df.loc[done, "Journal No"]}
 
 
-def sync_status_updates(source: SourceTab, synced_jvs: set[str], clash_jvs: set[str]) -> list[dict]:
-    """Source Status cells to change after a sync: `Transformed <JV>` -> `Synced <JV>` or ERROR."""
+def sync_status_updates(source: SourceTab, synced_jvs: set[str]) -> list[dict]:
+    """Source Status cells to change after a sync: `Transformed <JV>` -> `Synced <JV>`.
+
+    Sync never writes ERROR to the source: an ERROR line is new to Transform, which would give
+    it a new number and post it again while the first copy may already be in QBO. Sync
+    failures stay in the Transform tab's Remarks and the control row's QBO Journal cell.
+    """
     updates = []
     for row in source.df.index:
         kind, jv = parse_status(source.df.at[row, STATUS_HEADER])
-        if kind != "transformed":
-            continue
-        if jv in clash_jvs:
-            updates.append({"row": row, "col": source.status_col, "val": CLASH_STATUS.format(jv=jv)})
-        elif jv in synced_jvs:
+        if kind == "transformed" and jv in synced_jvs:
             updates.append({"row": row, "col": source.status_col, "val": f"Synced {jv}"})
     return updates
 

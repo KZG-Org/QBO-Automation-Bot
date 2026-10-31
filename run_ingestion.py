@@ -645,11 +645,14 @@ def _process_month_end_row(
     def stop(note: str, reserved: int) -> int:
         message = f"⛔ Month-end tab '{tab_name}': {note}"
         logger.warning(f"   ⛔ [{client_name}] Row {row_num}: {message}")
-        update_control({
-            settings.CTRL_COL_ACTIVE: "ERROR",
-            settings.CTRL_COL_TRANSFORM_NOTE: message,
-            settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(),
-        })
+        try:
+            update_control({
+                settings.CTRL_COL_ACTIVE: "ERROR",
+                settings.CTRL_COL_TRANSFORM_NOTE: message,
+                settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(),
+            })
+        except Exception as e:
+            logger.error(f"   ❌ [{client_name}] Row {row_num}: could not write the stop note: {e}")
         return reserved
 
     # Two month-end rows for one month would each rebuild the other's journals.
@@ -666,16 +669,25 @@ def _process_month_end_row(
     if month_start is None:
         return stop(f"Month '{raw_month}' is not a date.", start_jv)
 
-    jv_in_tab, error_rows = _month_end_tab_state(gs.read_values(transform_url, tab_jv))
-    if error_rows:
-        logger.info(f"   [{client_name}] Month-end: removing {len(error_rows)} ERROR line(s) from '{tab_jv}' to rebuild them.")
-        gs.delete_rows(transform_url, tab_jv, error_rows)
-
     def read_source():
         return read_source_tab(gs.read_values(source_url, tab_name, value_render_option="UNFORMATTED_VALUE"))
 
+    # Read everything that decides what gets written. Any failure here stops before one write.
     try:
+        # Strict read: a failed read must not look like "no tab yet", or every journal not
+        # synced yet would be copied again (and posted with doubled lines).
+        jv_in_tab, error_rows = _month_end_tab_state(gs.read_tab_values(transform_url, tab_jv) or [])
         source = read_source()
+        if not source.has_status_header and (jv_in_tab or error_rows):
+            # Without Status every line looks new: the month would be renumbered and posted again.
+            return stop(
+                f"the Status column is missing, but '{tab_jv}' already has journals. "
+                f"Put the Status column back with its values, then run Transform again.",
+                start_jv,
+            )
+        if error_rows:
+            logger.info(f"   [{client_name}] Month-end: removing {len(error_rows)} ERROR line(s) from '{tab_jv}' to rebuild them.")
+            gs.delete_rows(transform_url, tab_jv, error_rows)
         plan = plan_month_end(
             source,
             client_name=client_name,
@@ -692,49 +704,63 @@ def _process_month_end_row(
                 return stop(f"the tab changed during Transform (rows {shown}). Run Transform again.", start_jv)
     except MonthEndInputError as e:
         return stop(f"{e}.", start_jv)
+    except Exception as e:
+        return stop(
+            f"could not read the source tab or '{tab_jv}' ({e}). Nothing was written. Run Transform again.",
+            start_jv,
+        )
 
     reserved = max(start_jv, plan.last_journal_no)
     update_control({col_last_jv: reserved})
 
+    # The numbers are taken from here on. Never raise past this point: the caller must get
+    # `reserved` so the next row of this run starts after these numbers.
     try:
-        if plan.status_updates and not source.has_status_header:
-            gs.update_cell(source_url, tab_name, 1, source.status_col, STATUS_HEADER)
-        gs.batch_update_cells(source_url, tab_name, [
-            {"row": r, "col": source.status_col, "val": text}
-            for r, text in sorted(plan.status_updates.items())
-        ])
+        try:
+            if plan.status_updates and not source.has_status_header:
+                gs.update_cell(source_url, tab_name, 1, source.status_col, STATUS_HEADER)
+            gs.batch_update_cells(source_url, tab_name, [
+                {"row": r, "col": source.status_col, "val": text}
+                for r, text in sorted(plan.status_updates.items())
+            ])
+        except Exception as e:
+            return stop(
+                f"the bot could not write Status ({e}). Its Google account needs Editor access on this file. "
+                f"Nothing was copied.",
+                reserved,
+            )
+
+        if not plan.journals.empty:
+            template = (
+                settings.MONTH_END_TEMPLATE_TAB
+                if settings.MONTH_END_TEMPLATE_TAB in gs.worksheet_titles(control_sheet_id)
+                else settings.JOURNAL_TEMPLATE_TAB
+            )
+            gs.append_or_create_df(
+                transform_url, tab_jv, plan.journals,
+                template_tab_name=template, template_spreadsheet_id=control_sheet_id,
+            )
+            gs.cleanup_default_sheet(transform_url)
+
+        note = transform_note(plan, tab_name, month)
+        logger.info(f"   ✅ [{client_name}] Month-end row {row_num}: {note}")
+        updates = {
+            settings.CTRL_COL_ACTIVE: "DONE",
+            settings.CTRL_COL_TRANSFORM_NOTE: note,
+            settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(),
+        }
+        if col_qbo_jv in ctrl_df.columns:
+            if plan.error_line_count:
+                updates[col_qbo_jv] = "ERROR"
+            elif not plan.journals.empty or str(row.get(col_qbo_jv, "")).strip().upper() == "ERROR":
+                updates[col_qbo_jv] = "READY TO SYNC"
+        update_control(updates)
     except Exception as e:
         return stop(
-            f"the bot could not write Status ({e}). Its Google account needs Editor access on this file. "
-            f"Nothing was copied.",
+            f"Transform stopped after giving out journal numbers ({e}). Run Transform again: "
+            f"the journals are rebuilt under the same numbers.",
             reserved,
         )
-
-    if not plan.journals.empty:
-        template = (
-            settings.MONTH_END_TEMPLATE_TAB
-            if settings.MONTH_END_TEMPLATE_TAB in gs.worksheet_titles(control_sheet_id)
-            else settings.JOURNAL_TEMPLATE_TAB
-        )
-        gs.append_or_create_df(
-            transform_url, tab_jv, plan.journals,
-            template_tab_name=template, template_spreadsheet_id=control_sheet_id,
-        )
-        gs.cleanup_default_sheet(transform_url)
-
-    note = transform_note(plan, tab_name, month)
-    logger.info(f"   ✅ [{client_name}] Month-end row {row_num}: {note}")
-    updates = {
-        settings.CTRL_COL_ACTIVE: "DONE",
-        settings.CTRL_COL_TRANSFORM_NOTE: note,
-        settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(),
-    }
-    if col_qbo_jv in ctrl_df.columns:
-        if plan.error_line_count:
-            updates[col_qbo_jv] = "ERROR"
-        elif not plan.journals.empty or str(row.get(col_qbo_jv, "")).strip().upper() == "ERROR":
-            updates[col_qbo_jv] = "READY TO SYNC"
-    update_control(updates)
     return reserved
 
 
