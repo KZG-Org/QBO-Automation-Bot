@@ -645,14 +645,20 @@ Transform and SYNC NOW dropdowns. Code: `src/logic/month_end.py` (pure planning)
 `_process_month_end_row()` in `run_ingestion.py`. Design:
 `docs/superpowers/specs/2026-10-30-month-end-jv-design.md`.
 
-**Control row.** One per company per month, in that company's control sheet:
+**Control row.** One per company per month, in that company's control sheet. A row is a month-end
+row when its `Country` **or** its `Tab Name` contains `Month-end`, in any spelling (`Month-end`,
+`Monthend`, `Month end`, `month_end`). `is_month_end_row()` in `src/logic/month_end.py` is the one
+rule; the KZO script's `isMonthEndRow_` copies it. So a row with a blank Country (KZO row 83,
+2026-10-31: it was read as a COY tab and stopped asking for a `No` column) or with its own
+country (S5 row 10, `S5` / `Month-end JV`) still runs as month-end. Do not put "month-end" in the
+tab name of a normal COY tab.
 
 | Column | Value |
 |---|---|
-| `Country` | `Month-end JV` (case and spaces ignored). This is what marks the row. |
-| `Source File` / `Tab Name` | The spreadsheet and tab with the lines (KZO keeps its tab in the TH COY file). Any tab name. |
+| `Country` | `Month-end JV` is clearest. Blank or a country also works when the tab name has "Month-end". |
+| `Source File` / `Tab Name` | The spreadsheet and tab with the lines (KZO keeps its tab in the TH COY file). |
 | `Month` / `Last Month Date` | As for normal rows. Only lines dated in that range are taken. |
-| `Transform File` | Leave blank: the bot creates `<client> - Month-end JV QBO - Oct 26`. |
+| `Transform File` | Leave blank: the bot creates `<client> - Month-end JV QBO - Oct 26`. File and tab names always use `Month-end JV`, never the Country, so a month-end row can never write into a country's `TH Oct 26 - Journals` tab (Transform deletes ERROR journals from the tab it reads). |
 | `No Column Check` (KZO) | Leave blank, or the script blocks Transform. |
 
 A second `Month-end JV` row for the same month is refused (`Transform` = `ERROR`): two rows would

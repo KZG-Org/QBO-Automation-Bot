@@ -63,9 +63,22 @@ class IsMonthEndRowTests(unittest.TestCase):
     def test_marker_ignores_case_and_spaces(self):
         self.assertTrue(is_month_end_row(" month-end  JV "))
 
+    def test_country_containing_month_end_in_any_spelling(self):
+        for country in ("Month-end JV", "Monthend", "month end", "MONTH-END", "Month_End JV"):
+            self.assertTrue(is_month_end_row(country), country)
+
+    def test_tab_name_alone_marks_the_row(self):
+        # Row 83 on 2026-10-31: Country left blank, tab 'Month-end JV_test'.
+        self.assertTrue(is_month_end_row("", "Month-end JV_test"))
+        self.assertTrue(is_month_end_row(pd.NA, "Monthend Oct"))
+        self.assertTrue(is_month_end_row("TH", "Month End JV"))
+
     def test_country_rows_are_not_month_end(self):
         self.assertFalse(is_month_end_row("TH"))
         self.assertFalse(is_month_end_row(None))
+        self.assertFalse(is_month_end_row("TH", "Transaction 2026 (COY TH)"))
+        self.assertFalse(is_month_end_row(pd.NA, "Sample Data_TH"))
+        self.assertFalse(is_month_end_row("", ""))
 
 
 class ParseStatusTests(unittest.TestCase):
@@ -401,6 +414,23 @@ class ProcessMonthEndRowTests(unittest.TestCase):
         _run(gs)
         gs.update_cell.assert_any_call(SOURCE, TAB, 1, 9, "Status")
 
+    def test_second_month_end_row_found_by_tab_name_is_refused_too(self):
+        other = {"Country": "", "Source File": SOURCE, "Tab Name": "Monthend Oct", "Month": "2026-10-01"}
+        gs = _gs([self.GRID])
+        _run(gs, ctrl=_ctrl(other))
+        gs.read_values.assert_not_called()
+        self.assertIn("row 3", _control_updates(gs)["Transform Note"])
+
+    def test_tab_name_is_the_same_whatever_the_country_says(self):
+        # A month-end row with Country 'TH' must never write into 'TH Oct 26 - Journals',
+        # the normal TH tab, where Transform would delete the normal rows' ERROR journals.
+        ctrl = _ctrl()
+        ctrl.loc[0, "Country"] = "TH"
+        gs = _gs([self.GRID])
+        _run(gs, ctrl=ctrl)
+        self.assertEqual(gs.append_or_create_df.call_args.args[1], TAB_JV)
+        gs.read_tab_values.assert_called_with(TRANSFORM, TAB_JV)
+
     def test_second_month_end_row_for_the_same_month_is_refused(self):
         other = {"Country": "Month-end JV", "Source File": SOURCE, "Tab Name": "x", "Month": "2026-10-01"}
         gs = _gs([self.GRID])
@@ -451,7 +481,7 @@ class ProcessMonthEndRowTests(unittest.TestCase):
 class ControlSheetRunTests(unittest.TestCase):
     """The real per-client loop, with Sheets and QBO stubbed."""
 
-    def _run_control_sheet(self, ctrl, grid, append=None):
+    def _run_control_sheet(self, ctrl, grid, append=None, create=None):
         from unittest.mock import MagicMock, patch
         from run_ingestion import process_client_control_sheet
 
@@ -464,6 +494,8 @@ class ControlSheetRunTests(unittest.TestCase):
         gs.read_tab_values.return_value = None  # no Transform tab yet
         if append:
             gs.append_or_create_df.side_effect = append
+        if create:
+            gs.create_spreadsheet.return_value = create
         qbo = MagicMock()
         qbo.get_max_journal_number.return_value = 1371
         with patch("run_ingestion.QBOSync") as sync_cls:
@@ -515,6 +547,21 @@ class ControlSheetRunTests(unittest.TestCase):
         self.assertEqual(oct_updates["Last Journal No"], "1418")
         self.assertEqual(oct_updates["Transform"], "ERROR")
         self.assertIn("Run Transform again", oct_updates["Transform Note"])
+
+    def test_blank_country_with_a_month_end_tab_runs_as_month_end(self):
+        from unittest.mock import patch
+        # Row 83 on 2026-10-31: Country blank, Transform File blank, tab 'Month-end JV_test'.
+        ctrl = pd.DataFrame([{"Country": pd.NA, "Source File": SOURCE, "Tab Name": TAB,
+                              "Month": "2026-10-01", "Transform File": pd.NA, "Transform": "READY"}],
+                            columns=CTRL_COLUMNS)
+        with patch("run_ingestion._read_source_raw_df") as raw_read, \
+                patch("run_ingestion.check_raw_no_column") as no_check:
+            gs = self._run_control_sheet(ctrl, [HEADER] + reclass_lines(),
+                                         create=TRANSFORM)
+        raw_read.assert_not_called()
+        no_check.assert_not_called()
+        gs.create_spreadsheet.assert_called_once_with("KZO - Month-end JV QBO - Oct 26")
+        self.assertEqual(gs.append_or_create_df.call_args.args[:2], (TRANSFORM, TAB_JV))
 
     def test_month_end_row_skips_the_raw_pipeline(self):
         from unittest.mock import patch
@@ -604,11 +651,11 @@ class SyncHelperTests(unittest.TestCase):
 class ProcessClientSyncTests(unittest.TestCase):
     """run_syncing.process_client_sync with Sheets and QBO stubbed."""
 
-    def _sync(self, country, tab_df, existing, qbo_details):
+    def _sync(self, country, tab_df, existing, qbo_details, tab_name=TAB):
         from unittest.mock import MagicMock, patch
         from run_syncing import process_client_sync
 
-        ctrl = pd.DataFrame([{"Country": country, "Source File": SOURCE, "Tab Name": TAB, "Month": "2026-10-01",
+        ctrl = pd.DataFrame([{"Country": country, "Source File": SOURCE, "Tab Name": tab_name, "Month": "2026-10-01",
                               "Transform File": TRANSFORM, "QBO Sync": "SYNC NOW"}],
                             columns=CTRL_COLUMNS + ["QBO Expense", "QBO Transfer", "Last Sync At"]).fillna("")
         gs = MagicMock()
@@ -634,7 +681,17 @@ class ProcessClientSyncTests(unittest.TestCase):
             remarks.setdefault(tab_df.loc[c.args[0]["row_idx"], "Journal No"], set()).add(c.args[0]["status"])
         source_writes = {u["row"]: u["val"] for c in gs.batch_update_cells.call_args_list
                          if c.args[0] == SOURCE for u in c.args[2]}
+        self.tabs_read = [c.args[1] for c in gs.read_as_df_sync.call_args_list]
         return engine, remarks, source_writes, _control_updates_sync(gs)
+
+    def test_blank_country_with_a_month_end_tab_syncs_as_month_end(self):
+        tab_df = pd.DataFrame(_tab_lines("KZO-JV1400", [1.0, -1.0]))
+        engine, _, source_writes, _ = self._sync(
+            "", tab_df, existing={"KZO-JV1400"}, qbo_details={"KZO-JV1400": [("2026-10-31", MEMO)]},
+        )
+        self.assertIn("Month-end JV Oct 26 - Journals", self.tabs_read)
+        engine.get_journal_details.assert_called_once()
+        self.assertEqual({source_writes[11], source_writes[12]}, {"Synced KZO-JV1400"})
 
     def test_month_end_clash_is_stopped_and_the_rest_is_posted(self):
         tab_df = pd.DataFrame(_tab_lines("KZO-JV1418", [amt for _, amt in KZO_RECLASS])
@@ -665,6 +722,7 @@ class ProcessClientSyncTests(unittest.TestCase):
         tab_df = pd.DataFrame(_tab_lines("KZO-JV1400", [1.0, -1.0]))
         engine, remarks, source_writes, _ = self._sync(
             "TH", tab_df, existing={"KZO-JV1400"}, qbo_details={"KZO-JV1400": [("2026-01-01", "x")]},
+            tab_name="Transaction 2026 (COY TH)",
         )
         engine.get_journal_details.assert_not_called()
         self.assertTrue(all(s.startswith("Skipper") for s in remarks["KZO-JV1400"]))
@@ -672,11 +730,11 @@ class ProcessClientSyncTests(unittest.TestCase):
 
 
 class ReconcileTests(unittest.TestCase):
-    def _reconcile(self, country):
+    def _reconcile(self, country, tab_name=TAB):
         from unittest.mock import MagicMock, patch
         from run_reconciliation import process_client_reconcile
 
-        ctrl = pd.DataFrame([{"Country": country, "Source File": SOURCE, "Tab Name": TAB, "Month": "2026-10-01",
+        ctrl = pd.DataFrame([{"Country": country, "Source File": SOURCE, "Tab Name": tab_name, "Month": "2026-10-01",
                               "Transform File": TRANSFORM, "QBO Reconcile": "RECONCILE NOW"}],
                             columns=CTRL_COLUMNS).fillna("")
         tab_df = pd.DataFrame(_tab_lines("KZO-JV1418", [1.0, -1.0], remarks="Synced at x"))
@@ -699,8 +757,14 @@ class ReconcileTests(unittest.TestCase):
         self.assertIn("Month-end JV Oct 26 - Journals", tab_read)
 
     def test_country_rows_still_read_the_raw_tab(self):
-        gs, _ = self._reconcile("TH")
+        gs, _ = self._reconcile("TH", tab_name="Transaction 2026 (COY TH)")
         self.assertTrue(any(c.args[0] == SOURCE for c in gs.read_as_df.call_args_list))
+
+    def test_blank_country_with_a_month_end_tab_reconciles_as_month_end(self):
+        gs, reconciler = self._reconcile(pd.NA)
+        self.assertFalse(any(c.args[0] == SOURCE for c in gs.read_as_df.call_args_list))
+        self.assertIn("Month-end JV Oct 26 - Journals", [c.args[1] for c in gs.read_as_df_sync.call_args_list])
+        reconciler.reconcile_journals.assert_called_once()
 
 
 def _control_updates_sync(gs):

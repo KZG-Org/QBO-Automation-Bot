@@ -628,12 +628,13 @@ def _process_month_end_row(
     Transform tab, so an interrupted run can leave a gap but never reuses a number or copies
     a line twice.
     """
-    country = str(row.get(settings.CTRL_COL_COUNTRY, "")).strip()
     source_url = str(row.get(settings.CTRL_COL_SOURCE_URL, "")).strip()
     tab_name = str(row.get(settings.CTRL_COL_TAB_NAME, "")).strip()
     raw_month = str(row.get(settings.CTRL_COL_MONTH, "")).strip()
     month = format_month_name(raw_month)
-    tab_jv = f"{country} {month} - {settings.OUTPUT_TAB_JOURNALS}"
+    # Always the month-end label, whatever Country says: 'TH Oct 26 - Journals' would be the
+    # normal TH tab, and step 1 below deletes ERROR journals from the tab it reads.
+    tab_jv = f"{settings.MONTH_END_COUNTRY} {month} - {settings.OUTPUT_TAB_JOURNALS}"
     col_last_jv, col_qbo_jv = "Last Journal No", "QBO Journal"
 
     def update_control(values: dict):
@@ -659,7 +660,7 @@ def _process_month_end_row(
     others = [
         i + 2 for i, r in ctrl_df.iterrows()
         if i + 2 != row_num
-        and is_month_end_row(r.get(settings.CTRL_COL_COUNTRY))
+        and is_month_end_row(r.get(settings.CTRL_COL_COUNTRY), r.get(settings.CTRL_COL_TAB_NAME))
         and format_month_name(str(r.get(settings.CTRL_COL_MONTH, "")).strip()) == month
     ]
     if others:
@@ -866,6 +867,11 @@ def process_client_control_sheet(
             raw_month = str(row.get(settings.CTRL_COL_MONTH, "")).strip()
             last_month_date = row.get(settings.CTRL_COL_LAST_MONTH_DATE, "")
             month = format_month_name(raw_month)
+            # Month-end JV rows are found by Country or Tab Name and always use the month-end
+            # label for their Transform file and tab names, never a country's.
+            is_month_end = is_month_end_row(country, raw_tab_name)
+            if is_month_end:
+                country = settings.MONTH_END_COUNTRY
 
             # 3. Create/Link Transform File
             created_new_transform = False
@@ -921,7 +927,7 @@ def process_client_control_sheet(
             tab_jv, tab_exp, tab_tr = f"{tab_prefix} - Journals", f"{tab_prefix} - Expenses", f"{tab_prefix} - Transfers"
 
             # Month-end JV rows read hand-entered journal lines, not a COY raw tab.
-            if is_month_end_row(country):
+            if is_month_end:
                 global_last_jv = max(global_last_jv, _process_month_end_row(
                     gs, control_sheet_id, ctrl_df, row, row_num, client_name,
                     qbo_mappings, transform_url, final_start_jv,

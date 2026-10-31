@@ -290,7 +290,9 @@ def process_client_sync(
         
         has_error = False
         jv_status, exp_status, tr_status = "Skipped", "Skipped", "Skipped"
-        is_month_end = is_month_end_row(country)
+        is_month_end = is_month_end_row(country, row.get(settings.CTRL_COL_TAB_NAME, ""))
+        if is_month_end:
+            country = settings.MONTH_END_COUNTRY  # same tab names Transform wrote
 
         dt_label = pd.to_datetime(month_str).strftime("%b %y")
         tab_jv = f"{country} {dt_label} - Journals"

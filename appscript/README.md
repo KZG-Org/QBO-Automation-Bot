@@ -45,8 +45,9 @@ control rows one at a time: `triggerSingleRowAction` writes the keyword into the
 cell and sends the same webhook (no confirmation prompt), and the dialog polls `checkRowStatus`
 until that row finishes before starting the next. For *Transform*, a row whose column T is `TRUE`
 is refused and marked `ERROR` ("clean the No. column in the COY raw file"). A failed webhook also
-marks the cell `ERROR`. Rows whose Country is `Month-end JV` are left out of the menu
-(`isMonthEndRow_`); they are run from their own row's dropdowns.
+marks the cell `ERROR`. Month-end JV rows (Country or Tab Name contains "Month-end", any
+spelling; same rule as the bot) are left out of the menu (`isMonthEndRow_`); they are run from
+their own row's dropdowns.
 
 The trigger itself (an installable *On edit* trigger calling `confirmAndSendWebhook`) is set in the
 Apps Script editor under **Triggers**. `clasp` does not pull or push triggers.

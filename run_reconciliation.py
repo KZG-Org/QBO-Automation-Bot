@@ -213,6 +213,9 @@ def process_client_reconcile(
 
         row_num = i + 2
         country = row.get(settings.CTRL_COL_COUNTRY)
+        is_month_end = is_month_end_row(country, row.get(settings.CTRL_COL_TAB_NAME))
+        if is_month_end:
+            country = settings.MONTH_END_COUNTRY  # same tab names Transform wrote
         transform_url = row.get(settings.CTRL_COL_TRANSFORM_URL)
         month_str = str(row.get(settings.CTRL_COL_MONTH, ""))
         raw_month = month_str.strip()
@@ -234,7 +237,7 @@ def process_client_reconcile(
 
         raw_df = pd.DataFrame()
 
-        if is_month_end_row(country):
+        if is_month_end:
             # Month-end lines have no raw 'No' to compare; the QBO check below still runs.
             logger.info(f"   ⏭️ [{client_name}] Month-end JV row: raw-vs-transform check skipped.")
         elif RECONCILE_ENABLE_RAW_CHECK:

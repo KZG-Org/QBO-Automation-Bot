@@ -230,8 +230,14 @@ function openOrchestratorDialog_(actionKey) {
 }
 
 // Month-end JV rows are run from their own row's dropdowns, never from the bulk menu.
-function isMonthEndRow_(country) {
-  return String(country).trim().toLowerCase().replace(/\s+/g, ' ') === 'month-end jv';
+// Same rule as the bot (src/logic/month_end.py): Country or Tab Name contains "Month-end",
+// in any spelling ("Monthend", "Month end", ...).
+function hasMonthEnd_(value) {
+  return String(value || '').toLowerCase().replace(/[\s_\-]+/g, '').indexOf('monthend') !== -1;
+}
+
+function isMonthEndRow_(country, tabName) {
+  return hasMonthEnd_(country) || hasMonthEnd_(tabName);
 }
 
 function getDialogData_(actionKey) {
@@ -255,7 +261,7 @@ function getDialogData_(actionKey) {
     const country = String(values[i][0]).trim();
     const month = String(values[i][3]).trim();
 
-    if (country && month && !isMonthEndRow_(country)) {
+    if (country && month && !isMonthEndRow_(country, values[i][2])) {
       rowItems.push({
         rowIndex: i + 1,
         country,
@@ -302,7 +308,7 @@ function getTargetsForExecution(actionKey, month, countries) {
     const rowCountry = String(values[i][0]).trim();
     const rowMonth = String(values[i][3]).trim();
 
-    if (rowMonth === month && countries.includes(rowCountry) && !isMonthEndRow_(rowCountry)) {
+    if (rowMonth === month && countries.includes(rowCountry) && !isMonthEndRow_(rowCountry, values[i][2])) {
       targets.push({
         rowIndex: i + 1,
         country: rowCountry,

@@ -76,7 +76,7 @@ CO, BR, BD = 17,167.88; credit GROUP = -17,167.88). Rows 11-12 show the shape ot
 
 | Column | Value |
 |---|---|
-| A `Country` | `Month-end JV` (exact text, case and outer spaces ignored). This marks the row. |
+| A `Country` | `Month-end JV`. Changed 2026-10-31 (user): a row is month-end when Country **or** Tab Name contains "Month-end" in any spelling (Monthend, Month end). File and tab names always use `Month-end JV`, never the Country. |
 | B `Source File` | Link to the spreadsheet holding the source tab. |
 | C `Tab Name` | The source tab name. Any name. |
 | D `Month` | First day of the month, e.g. `2026-10-01`. |

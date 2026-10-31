@@ -49,13 +49,27 @@ class MonthEndInputError(Exception):
 
 
 def _norm_text(value) -> str:
-    if value is None or (isinstance(value, float) and math.isnan(value)):
+    if value is None:
         return ""
+    try:
+        if pd.isna(value):  # NaN and pd.NA (blank control cells read as NA)
+            return ""
+    except (TypeError, ValueError):
+        pass
     return " ".join(str(value).split())
 
 
-def is_month_end_row(country) -> bool:
-    return _norm_text(country).lower() == settings.MONTH_END_COUNTRY.lower()
+def _has_month_end_marker(value) -> bool:
+    return "monthend" in re.sub(r"[\s_\-]+", "", _norm_text(value).lower())
+
+
+def is_month_end_row(country, tab_name="") -> bool:
+    """A Month-end JV control row: Country or Tab Name contains 'Month-end'.
+
+    Any spelling counts ('Month-end', 'Monthend', 'Month end', 'month_end'), so a row whose
+    Country was left blank is still recognised by its tab ('Month-end JV_test').
+    """
+    return _has_month_end_marker(country) or _has_month_end_marker(tab_name)
 
 
 def parse_status(value) -> tuple[str, str | None]:
