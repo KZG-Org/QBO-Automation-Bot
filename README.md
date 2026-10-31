@@ -149,6 +149,22 @@ Consequences worth knowing:
   what catches this case. KZO is the exception: it re-creates a deleted row whose raw row is
   still ready (see [below](#kzo-ready-rows-below-the-checkpoint-are-still-picked-up)).
 
+#### Journal numbers are saved before the Transform write
+
+Journal numbers (`KZO-JV1418`, …) live nowhere but the Transform file until sync puts them in
+QBO. Each run starts from the highest `Last Journal No` in the control sheet or QBO. Two things
+used to let a number be minted twice, and sync then skips the second journal as "already synced"
+without an error, so it never reaches QBO:
+
+- `Last Journal No` was written in the final control update (step 15), after the Transform write
+  (step 13). A run that stopped in between left the counter low.
+- The counter was read once per run, so two READY rows of one company in the same run (two KZO
+  countries, or a country and its Month-end JV row) started from the same number.
+
+Now step 12b (`_reserve_journal_numbers()`) writes `Last Journal No` right after numbering,
+before anything else, and carries the counter to the next row of the run. An interrupted run
+can leave a gap in the numbers, never a reused one. Expense and Transfer counters are unchanged.
+
 #### KZO: `Last Processed Row` is a live formula
 
 For **KZO only**, the pipeline writes a formula into `Last Processed Row` instead of the number
@@ -620,6 +636,79 @@ Accounts are matched exactly, so a missing account fails the row with
    already posted, create the Transform File first and set the checkpoint yourself.
 4. A new client family (a raw layout none of the existing branches reads) needs code in the
    files listed under [AI Codebase Graph](#ai-codebase-graph).
+
+### Month-end JV rows
+
+Month-end journals (group cost reclasses and the like, posted with SaaSant until Sep 2026) go
+through the bot from **Oct 2026**: the team types the lines in a source tab, then uses the normal
+Transform and SYNC NOW dropdowns. Code: `src/logic/month_end.py` (pure planning) and
+`_process_month_end_row()` in `run_ingestion.py`. Design:
+`docs/superpowers/specs/2026-10-30-month-end-jv-design.md`.
+
+**Control row.** One per company per month, in that company's control sheet:
+
+| Column | Value |
+|---|---|
+| `Country` | `Month-end JV` (case and spaces ignored). This is what marks the row. |
+| `Source File` / `Tab Name` | The spreadsheet and tab with the lines (KZO keeps its tab in the TH COY file). Any tab name. |
+| `Month` / `Last Month Date` | As for normal rows. Only lines dated in that range are taken. |
+| `Transform File` | Leave blank: the bot creates `<client> - Month-end JV QBO - Oct 26`. |
+| `No Column Check` (KZO) | Leave blank, or the script blocks Transform. |
+
+A second `Month-end JV` row for the same month is refused (`Transform` = `ERROR`): two rows would
+rebuild each other's journals. The KZO bulk menu skips these rows; run them from their own
+dropdowns.
+
+**Source tab.** Header on row 1, found by name: `Date, Memo, Account, Amount, Name, Location,
+Currency Code, Class, Status`. `Date, Memo, Account, Amount` are required (a missing one stops
+Transform and the note names it). `Status` belongs to the bot; if the column is missing, the bot
+adds it after the last header. Each company needs its own tab: a Status with another company's
+prefix (`KZP-JV…` in a KZO run) stops Transform.
+
+- Amount: positive = debit, negative = credit. **Not rounded or adjusted**: more than 2 decimals is
+  an error (`Use ROUND(...,2) in the sheet`), and each journal must balance to the cent.
+- Grouping: lines with the same Date + Memo are one journal; for KZO (and KZO Sports) also the same
+  Account. A KZO entry that spans two accounts therefore fails as unbalanced.
+- Currency: KZO, KZP, S5, UMBER post USD only. KZDW / TINDERPAY: one currency per journal; a
+  non-USD journal posts at QBO's rate for that date.
+- Location and a typed Class must exist in QBO. A blank Class takes the Location. S5 / UMBER leave
+  both blank, as on normal rows. Account matching is the normal exact / suffix-path rule.
+
+**Transform.** Writes `Month-end JV Oct 26 - Journals` from the control sheet's
+`Sample - Journals_monthend` template (its header notes come along; use Insert > Note, comments do
+not copy), or `Sample - Journals` if that tab does not exist. Lines have a blank `No` and
+`Remarks` = `Ready to sync`. Journal numbers continue the client's normal sequence. Order, so a
+stopped run never duplicates:
+
+1. Drop every journal in the tab that has an `ERROR` remark (it is rebuilt from the source).
+2. Read the source, group, check, number. Re-read; if any used row moved or changed, stop
+   (`the tab changed during Transform`).
+3. Save `Last Journal No`.
+4. Write `Status`: `Transformed KZO-JV1418`, or `ERROR: <reason>` on every line of a failed
+   journal. If the bot cannot write (no **Editor** access on the source file), stop; nothing is
+   copied.
+5. Append the good journals.
+
+Lines with `Status` blank or `ERROR…` are new. `Transformed <JV>` whose journal is missing from the
+tab is rebuilt under the **same** number; `Synced <JV>` is never read again. `Transform Note` sums
+it up (journals ready, journals with errors, lines left for another month). `QBO Journal` =
+`ERROR` while any line has an error, which blocks SYNC NOW until it is fixed.
+
+**Sync.** Posts the tab like any Journals tab, with one extra check: a number that is already in
+QBO is skipped as "already synced" only if the QBO journal has the same date and total. Otherwise
+the lines get `ERROR: <JV> is already used in QBO by a different journal`, `QBO Journal` =
+`SYNC FAIL`, and the source Status says to run Transform, which gives those lines a new number.
+Afterwards the source Status of posted journals becomes `Synced <JV>`.
+
+**Reconcile.** QBO check only; there is no raw `No` to compare.
+
+**Rules for the team**
+
+- Never type in or clear `Status`. A cleared `Transformed` line looks new and makes a second
+  journal. To redo a journal that is not synced yet, edit the source lines and put `ERROR` in its
+  `Remarks` in the Transform tab, then run Transform. A synced journal is fixed in QBO by hand.
+- Do not create a Month-end JV row for a month SaaSant already posted.
+- The bot's Google account needs **Editor** access on every file that holds a month-end tab.
 
 ### Monthly deployment (new month tab)
 Create a new row in Control sheet with:

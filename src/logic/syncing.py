@@ -265,6 +265,30 @@ class QBOSync:
             )
         return None
 
+    def get_journal_totals(self, doc_nums: list) -> dict[str, list[tuple[str, float]]]:
+        """{DocNumber: [(TxnDate, TotalAmt), ...]} for journals already in QBO.
+
+        A list, because QBO allows two journals with one DocNumber. A chunk whose query fails is
+        left out (logged), so callers treat those numbers as unknown.
+        """
+        found: dict[str, list[tuple[str, float]]] = {}
+        clean_docs = sorted({str(d).strip() for d in doc_nums if str(d).strip()})
+        for i in range(0, len(clean_docs), 50):
+            chunk = [d.replace("'", "\\'") for d in clean_docs[i:i + 50]]
+            formatted_list = "', '".join(chunk)
+            query = (
+                "SELECT DocNumber, TxnDate, TotalAmt FROM JournalEntry "
+                f"WHERE DocNumber IN ('{formatted_list}')"
+            )
+            try:
+                for item in self.client.query(query):
+                    found.setdefault(str(item.get("DocNumber")), []).append(
+                        (str(item.get("TxnDate", "")), float(item.get("TotalAmt", 0) or 0))
+                    )
+            except Exception as e:
+                logger.error(f"⚠️ Failed journal detail lookup: {e}")
+        return found
+
     def get_existing_duplicates(
         self,
         entity_type: str,

@@ -394,6 +394,12 @@ def _currency_mismatch_error(
     )
 
 
+def journal_columns(client_name: str = "") -> list[str]:
+    """Column order of a Transform 'Journals' tab; the 'Sample - Journals' template matches it."""
+    if _is_kzdw_case(client_name):
+        return ["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Currency Exchange", "Class", "Remarks"]
+    return ["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Class", "Remarks"]
+
 def _build_id_prefixes(client_name: str = "") -> tuple[str, str]:
     if _is_umber_case(client_name):
         return UMBER_JV_PREFIX, UMBER_DOC_PREFIX
@@ -959,10 +965,7 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
     total_journals["Remarks"] = total_journals.apply(validate_journal_row, axis=1)
     total_journals["Class"] = ""  if _is_s5_or_umber_case(client_name) else total_journals.get("Location", "").fillna("")
 
-    if _is_kzdw_case(client_name):
-        cols_order = ["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Currency Exchange", "Class", "Remarks"]
-    else:
-        cols_order = ["No", "Journal No", "Date", "Memo", "Account", "Amount", "Name", "Location", "Currency Code", "Class", "Remarks"]
+    cols_order = journal_columns(client_name)
     for c in cols_order:
         if c not in total_journals.columns: total_journals[c] = ""
     

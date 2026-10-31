@@ -229,6 +229,11 @@ function openOrchestratorDialog_(actionKey) {
   );
 }
 
+// Month-end JV rows are run from their own row's dropdowns, never from the bulk menu.
+function isMonthEndRow_(country) {
+  return String(country).trim().toLowerCase().replace(/\s+/g, ' ') === 'month-end jv';
+}
+
 function getDialogData_(actionKey) {
   const sheet = SpreadsheetApp
     .getActiveSpreadsheet()
@@ -250,7 +255,7 @@ function getDialogData_(actionKey) {
     const country = String(values[i][0]).trim();
     const month = String(values[i][3]).trim();
 
-    if (country && month) {
+    if (country && month && !isMonthEndRow_(country)) {
       rowItems.push({
         rowIndex: i + 1,
         country,
@@ -297,7 +302,7 @@ function getTargetsForExecution(actionKey, month, countries) {
     const rowCountry = String(values[i][0]).trim();
     const rowMonth = String(values[i][3]).trim();
 
-    if (rowMonth === month && countries.includes(rowCountry)) {
+    if (rowMonth === month && countries.includes(rowCountry) && !isMonthEndRow_(rowCountry)) {
       targets.push({
         rowIndex: i + 1,
         country: rowCountry,

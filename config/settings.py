@@ -28,6 +28,12 @@ CTRL_COL_LAST_PROCESSED_ROW = "Last Processed Row"
 CTRL_COL_PENDING_NOS_NOTE = "Pending Nos Note"
 CTRL_COL_TRANSFORM_NOTE = "Transform Note"  # why Transform stopped (e.g. broken raw No column); created on first use
 
+# Month-end JV rows: a control row whose Country is this text reads hand-entered journal lines
+# instead of a COY raw tab (see README "Month-end JV rows").
+MONTH_END_COUNTRY = "Month-end JV"
+MONTH_END_TEMPLATE_TAB = "Sample - Journals_monthend"
+JOURNAL_TEMPLATE_TAB = "Sample - Journals"
+
 # Raw data expectations
 RAW_COL_NO = os.getenv("RAW_COL_NO", "No")  # incremental row id / sequence
 

@@ -26,6 +26,15 @@ from src.logic.transformer import transform_raw, _build_id_prefixes
 from src.utils.logger import setup_logger
 from src.logic.raw_adapter import standardize_raw_df, read_s5_raw_df, RAW_STANDARD_COLUMNS
 from src.logic.no_column_check import check_raw_no_column
+from src.logic.month_end import (
+    MonthEndInputError,
+    STATUS_HEADER,
+    changed_rows,
+    is_month_end_row,
+    plan_month_end,
+    read_source_tab,
+    transform_note,
+)
 from src.utils.run_lock import single_instance_lock
 from gspread.utils import rowcol_to_a1
 
@@ -557,6 +566,178 @@ def _get_sheet_rows_for_nos(
     rows = work_df[work_df["_no"].isin(target_nos)]["_sheet_row"].astype(int).unique().tolist()
     return sorted(rows, reverse=True)
 
+def _reserve_journal_numbers(
+    gs, control_sheet_id: str, ctrl_df: pd.DataFrame, row_num: int, last_journal_no: int, global_last_jv: int
+) -> int:
+    """Save this row's Last Journal No before anything is written to the Transform file.
+
+    Journal numbers live nowhere else until sync puts them in QBO. If a run stopped after the
+    Transform write but before the final control update, the next run would mint the same
+    numbers again and sync would skip the second journal as "already synced". Writing the
+    counter first turns that into a harmless gap. Returns the run-wide counter for the next row.
+    """
+    _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {
+        "Last Journal No": last_journal_no,
+    })
+    return max(global_last_jv, last_journal_no)
+
+
+def _month_end_tab_state(values: list[list]) -> tuple[set[str], list[int]]:
+    """(journal numbers in a month-end Transform tab, sheet rows of journals flagged ERROR).
+
+    A journal with any ERROR line (a sync failure, or a user asking for a rebuild) is dropped
+    whole; its source lines still say 'Transformed <JV>', so the plan rebuilds it under the
+    same number.
+    """
+    if not values:
+        return set(), []
+    header = [str(h).strip() for h in values[0]]
+    if "Journal No" not in header:
+        return set(), []
+    jv_idx = header.index("Journal No")
+    rem_idx = header.index("Remarks") if "Remarks" in header else None
+    jv_by_row: dict[int, str] = {}
+    error_jvs: set[str] = set()
+    for offset, row in enumerate(values[1:]):
+        jv = str(row[jv_idx]).strip() if jv_idx < len(row) else ""
+        if not jv:
+            continue
+        jv_by_row[offset + 2] = jv
+        remarks = str(row[rem_idx]) if rem_idx is not None and rem_idx < len(row) else ""
+        if "ERROR" in remarks.upper():
+            error_jvs.add(jv)
+    error_rows = sorted(r for r, jv in jv_by_row.items() if jv in error_jvs)
+    return set(jv_by_row.values()) - error_jvs, error_rows
+
+
+def _process_month_end_row(
+    gs,
+    control_sheet_id: str,
+    ctrl_df: pd.DataFrame,
+    row: pd.Series,
+    row_num: int,
+    client_name: str,
+    qbo_mappings: dict,
+    transform_url: str,
+    start_jv: int,
+) -> int:
+    """Transform one Month-end JV control row. Returns the highest journal number reserved.
+
+    Order matters for duplicates (README "Month-end JV rows"): the journal numbers are saved
+    to the control row before the source Status is written, and the Status before the
+    Transform tab, so an interrupted run can leave a gap but never reuses a number or copies
+    a line twice.
+    """
+    country = str(row.get(settings.CTRL_COL_COUNTRY, "")).strip()
+    source_url = str(row.get(settings.CTRL_COL_SOURCE_URL, "")).strip()
+    tab_name = str(row.get(settings.CTRL_COL_TAB_NAME, "")).strip()
+    raw_month = str(row.get(settings.CTRL_COL_MONTH, "")).strip()
+    month = format_month_name(raw_month)
+    tab_jv = f"{country} {month} - {settings.OUTPUT_TAB_JOURNALS}"
+    col_last_jv, col_qbo_jv = "Last Journal No", "QBO Journal"
+
+    def update_control(values: dict):
+        if settings.CTRL_COL_TRANSFORM_NOTE in values and settings.CTRL_COL_TRANSFORM_NOTE not in ctrl_df.columns:
+            gs.update_cell(control_sheet_id, settings.CONTROL_TAB_NAME, 1, len(ctrl_df.columns) + 1, settings.CTRL_COL_TRANSFORM_NOTE)
+            ctrl_df[settings.CTRL_COL_TRANSFORM_NOTE] = ""
+        _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, values)
+
+    def stop(note: str, reserved: int) -> int:
+        message = f"⛔ Month-end tab '{tab_name}': {note}"
+        logger.warning(f"   ⛔ [{client_name}] Row {row_num}: {message}")
+        update_control({
+            settings.CTRL_COL_ACTIVE: "ERROR",
+            settings.CTRL_COL_TRANSFORM_NOTE: message,
+            settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(),
+        })
+        return reserved
+
+    # Two month-end rows for one month would each rebuild the other's journals.
+    others = [
+        i + 2 for i, r in ctrl_df.iterrows()
+        if i + 2 != row_num
+        and is_month_end_row(r.get(settings.CTRL_COL_COUNTRY))
+        and format_month_name(str(r.get(settings.CTRL_COL_MONTH, "")).strip()) == month
+    ]
+    if others:
+        return stop(f"another Month-end JV row exists for {month} (row {others[0]}). Keep only one.", start_jv)
+
+    month_start, month_end = get_month_date_range(raw_month, row.get(settings.CTRL_COL_LAST_MONTH_DATE, ""))
+    if month_start is None:
+        return stop(f"Month '{raw_month}' is not a date.", start_jv)
+
+    jv_in_tab, error_rows = _month_end_tab_state(gs.read_values(transform_url, tab_jv))
+    if error_rows:
+        logger.info(f"   [{client_name}] Month-end: removing {len(error_rows)} ERROR line(s) from '{tab_jv}' to rebuild them.")
+        gs.delete_rows(transform_url, tab_jv, error_rows)
+
+    def read_source():
+        return read_source_tab(gs.read_values(source_url, tab_name, value_render_option="UNFORMATTED_VALUE"))
+
+    try:
+        source = read_source()
+        plan = plan_month_end(
+            source,
+            client_name=client_name,
+            month_start=month_start,
+            month_end=month_end,
+            start_jv=start_jv,
+            jv_in_tab=jv_in_tab,
+            qbo_mappings=qbo_mappings,
+        )
+        if plan.rows_to_verify:
+            moved = changed_rows(source, read_source(), plan.rows_to_verify)
+            if moved:
+                shown = ", ".join(str(r) for r in moved[:10])
+                return stop(f"the tab changed during Transform (rows {shown}). Run Transform again.", start_jv)
+    except MonthEndInputError as e:
+        return stop(f"{e}.", start_jv)
+
+    reserved = max(start_jv, plan.last_journal_no)
+    update_control({col_last_jv: reserved})
+
+    try:
+        if plan.status_updates and not source.has_status_header:
+            gs.update_cell(source_url, tab_name, 1, source.status_col, STATUS_HEADER)
+        gs.batch_update_cells(source_url, tab_name, [
+            {"row": r, "col": source.status_col, "val": text}
+            for r, text in sorted(plan.status_updates.items())
+        ])
+    except Exception as e:
+        return stop(
+            f"the bot could not write Status ({e}). Its Google account needs Editor access on this file. "
+            f"Nothing was copied.",
+            reserved,
+        )
+
+    if not plan.journals.empty:
+        template = (
+            settings.MONTH_END_TEMPLATE_TAB
+            if settings.MONTH_END_TEMPLATE_TAB in gs.worksheet_titles(control_sheet_id)
+            else settings.JOURNAL_TEMPLATE_TAB
+        )
+        gs.append_or_create_df(
+            transform_url, tab_jv, plan.journals,
+            template_tab_name=template, template_spreadsheet_id=control_sheet_id,
+        )
+        gs.cleanup_default_sheet(transform_url)
+
+    note = transform_note(plan, tab_name, month)
+    logger.info(f"   ✅ [{client_name}] Month-end row {row_num}: {note}")
+    updates = {
+        settings.CTRL_COL_ACTIVE: "DONE",
+        settings.CTRL_COL_TRANSFORM_NOTE: note,
+        settings.CTRL_COL_LAST_RUN_AT: _now_iso_local(),
+    }
+    if col_qbo_jv in ctrl_df.columns:
+        if plan.error_line_count:
+            updates[col_qbo_jv] = "ERROR"
+        elif not plan.journals.empty or str(row.get(col_qbo_jv, "")).strip().upper() == "ERROR":
+            updates[col_qbo_jv] = "READY TO SYNC"
+    update_control(updates)
+    return reserved
+
+
 # ==========================================
 # 2. CORE LOGIC (PER CLIENT)
 # ==========================================
@@ -712,7 +893,15 @@ def process_client_control_sheet(
 
             tab_prefix = f"{country} {month}"
             tab_jv, tab_exp, tab_tr = f"{tab_prefix} - Journals", f"{tab_prefix} - Expenses", f"{tab_prefix} - Transfers"
-        
+
+            # Month-end JV rows read hand-entered journal lines, not a COY raw tab.
+            if is_month_end_row(country):
+                global_last_jv = max(global_last_jv, _process_month_end_row(
+                    gs, control_sheet_id, ctrl_df, row, row_num, client_name,
+                    qbo_mappings, transform_url, final_start_jv,
+                ))
+                continue
+
             # 5. Read each Transform tab once: ERROR-retry context + the raw Nos it already
             #    holds (the durable record of what was actually produced).
             preserved_ids = {'journals': {}, 'expenses': {}, 'transfers': {}}
@@ -1058,6 +1247,12 @@ def process_client_control_sheet(
                 existing_ids=preserved_ids,
                 client_name=client_name
             )
+            # 12b. Reserve the journal numbers before writing them anywhere else, and carry the
+            #      counter to the next row of this run (it was read once, before the loop).
+            global_last_jv = _reserve_journal_numbers(
+                gs, control_sheet_id, ctrl_df, row_num, result.last_journal_no, global_last_jv
+            )
+
             # 13. Write Output
             # Note: We use 'control_sheet_id' as the template source. 
             # Assumes the Client's Control Sheet has the "Sample - Journals" etc. hidden tabs.
@@ -1103,7 +1298,6 @@ def process_client_control_sheet(
 
             updates = {
                 settings.CTRL_COL_LAST_PROCESSED_ROW: last_processed_cell,
-                COL_LAST_JV: result.last_journal_no,
                 COL_LAST_EXP: result.last_expense_no,
                 COL_LAST_TR: result.last_withdraw_no,
                 COL_PENDING_AMOUNT_NOS: _serialize_no_set(pending_to_write), # <-- ADDED

@@ -23,6 +23,14 @@ from config import settings
 from src.connectors.gsheets_client import GSheetsClient
 from src.connectors.qbo_client import QBOClient
 from src.logic.syncing import QBOSync
+from src.logic.month_end import (
+    CLASH_REMARK,
+    find_number_clashes,
+    is_month_end_row,
+    read_source_tab,
+    sync_status_updates,
+    synced_journal_nos,
+)
 from src.utils.logger import setup_logger
 from src.utils.run_lock import single_instance_lock
 
@@ -212,6 +220,24 @@ def _update_row_status_and_id(gs, spreadsheet_url, tab_name, updates: list, col_
 
     gs.batch_update_cells(spreadsheet_url, tab_name, batch_payload)
 
+def _write_back_month_end_status(gs, row: pd.Series, synced_jvs: set[str], clash_jvs: set[str]):
+    """Month-end rows: set the source Status of posted journals to 'Synced <JV>'.
+
+    Never fatal: QBO already holds the journals, and the next sync writes it again because
+    synced_jvs also covers journals the Transform tab already shows as synced.
+    """
+    source_url = str(row.get(settings.CTRL_COL_SOURCE_URL, "")).strip()
+    tab_name = str(row.get(settings.CTRL_COL_TAB_NAME, "")).strip()
+    try:
+        source = read_source_tab(gs.read_values(source_url, tab_name, value_render_option="UNFORMATTED_VALUE"))
+        updates = sync_status_updates(source, synced_jvs, clash_jvs)
+        if updates:
+            gs.batch_update_cells(source_url, tab_name, updates)
+            logger.info(f"   ✅ Month-end: updated Status on {len(updates)} source line(s) in '{tab_name}'.")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Month-end: could not update Status in '{tab_name}': {e}")
+
+
 def process_client_sync(
     gs: GSheetsClient,
     qbo_client: QBOClient,
@@ -264,6 +290,7 @@ def process_client_sync(
         
         has_error = False
         jv_status, exp_status, tr_status = "Skipped", "Skipped", "Skipped"
+        is_month_end = is_month_end_row(country)
 
         dt_label = pd.to_datetime(month_str).strftime("%b %y")
         tab_jv = f"{country} {dt_label} - Journals"
@@ -278,6 +305,9 @@ def process_client_sync(
         # ---------------------------------------------------------
         # 1. SYNC JOURNALS
         # ---------------------------------------------------------
+        posted_jvs: set[str] = set()
+        clash_jvs: set[str] = set()
+        df_jv = pd.DataFrame()
         try:
             logger.info(f"   Using Tab: {tab_jv}")
             try: df_jv = gs.read_as_df_sync(transform_url, tab_jv)
@@ -292,18 +322,35 @@ def process_client_sync(
                 else:
                     all_jv_nos = to_sync["Journal No"].unique().tolist()
                     existing_docs = sync_engine.get_existing_duplicates("JournalEntry", all_jv_nos)
+                    # Month-end rows: a number already in QBO is only skipped when it is this
+                    # same journal; otherwise the journal would be lost without an error.
+                    if is_month_end and existing_docs:
+                        clash_jvs = find_number_clashes(
+                            to_sync, existing_docs, sync_engine.get_journal_totals(list(existing_docs))
+                        )
                     updater = AsyncSheetUpdater(gs, transform_url, tab_jv, col_ctx=col_ctx, batch_size=BATCH_SIZE)
                     section_fail = False
                     try:
                         for jv_no, group in to_sync.groupby("Journal No"):
+                            if str(jv_no) in clash_jvs:
+                                msg = CLASH_REMARK.format(jv=jv_no)
+                                logger.error(f"   ❌ {msg}")
+                                has_error = True
+                                section_fail = True
+                                for idx in group.index:
+                                    updater.enqueue({"row_idx": idx, "status": msg, "qbo_id": "", "qbo_link": ""})
+                                continue
+
                             if str(jv_no) in existing_docs:
                                 already_synced_msg = f"Skipper (Already synced in QBO at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
                                 for idx in group.index:
                                     updater.enqueue({"row_idx": idx, "status": already_synced_msg, "qbo_id": "", "qbo_link": ""})
+                                posted_jvs.add(str(jv_no))
                                 continue
 
                             try:
                                 resp = sync_engine.push_journal(jv_no, group)
+                                posted_jvs.add(str(jv_no))
                                 _throttle_qbo_call()
                                 new_id = resp.get("JournalEntry", {}).get("Id", "")
                                 qbo_link = sync_engine.build_qbo_url("JournalEntry", new_id) if new_id else ""
@@ -326,6 +373,9 @@ def process_client_sync(
                     finally:
                         updater.close()
                     jv_status = "SYNC FAIL" if section_fail else "SYNCED"
+
+            if is_month_end and not df_jv.empty:
+                _write_back_month_end_status(gs, row, synced_journal_nos(df_jv) | posted_jvs, clash_jvs)
         except Exception as e:
             logger.error(f"   ❌ Journal Sync Fail: {e}")
             has_error = True

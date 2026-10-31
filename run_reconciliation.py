@@ -18,6 +18,7 @@ from config import settings
 from src.connectors.gsheets_client import GSheetsClient
 from src.connectors.qbo_client import QBOClient
 from src.logic.reconciler import Reconciler
+from src.logic.month_end import is_month_end_row
 from src.utils.logger import setup_logger
 from src.logic.raw_adapter import standardize_raw_df, read_s5_raw_df, RAW_STANDARD_COLUMNS
 from src.utils.run_lock import single_instance_lock
@@ -233,7 +234,10 @@ def process_client_reconcile(
 
         raw_df = pd.DataFrame()
 
-        if RECONCILE_ENABLE_RAW_CHECK:
+        if is_month_end_row(country):
+            # Month-end lines have no raw 'No' to compare; the QBO check below still runs.
+            logger.info(f"   ⏭️ [{client_name}] Month-end JV row: raw-vs-transform check skipped.")
+        elif RECONCILE_ENABLE_RAW_CHECK:
             try:
                 if source_url and raw_tab_name:
                     logger.info(f"   📥 [{client_name}] Fetching Raw Source for Validation...")

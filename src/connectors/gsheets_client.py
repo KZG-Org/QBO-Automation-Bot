@@ -149,6 +149,10 @@ class GSheetsClient:
         return self.gc.open_by_key(sid)
 
     @retry_with_backoff()
+    def worksheet_titles(self, spreadsheet_url_or_id: str) -> list[str]:
+        return [ws.title for ws in self.open(spreadsheet_url_or_id).worksheets()]
+
+    @retry_with_backoff()
     def read_values(self, spreadsheet_url_or_id: str, tab_name: str, value_render_option: str = 'FORMATTED_VALUE') -> list[list]:
         """Raw cell grid of a tab, as a list of rows. [] when the tab is missing.
 
