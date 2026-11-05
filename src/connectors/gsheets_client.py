@@ -255,16 +255,43 @@ class GSheetsClient:
             batch_payload.append({'range': a1_notation, 'values': [[str(u['val'])]]})
         ws.batch_update(batch_payload, value_input_option="USER_ENTERED")
 
-    @retry_with_backoff()
     def delete_rows(self, spreadsheet_url_or_id: str, tab_name: str, row_indices: list[int]):
-        if not row_indices: return
+        """Delete sheet rows (1-based) of one tab in one batchUpdate, or raise."""
+        self.delete_rows_by_tab(spreadsheet_url_or_id, {tab_name: row_indices})
+
+    def delete_rows_by_tab(self, spreadsheet_url_or_id: str, rows_by_tab: dict[str, list[int]]):
+        """Delete sheet rows (1-based) of several tabs of one spreadsheet in one batchUpdate.
+
+        One call per row used to hit the Sheets write quota (~60/min) on big ERROR retries,
+        and every failure was swallowed: the old rows stayed and the rebuilt ones were
+        appended next to them (S5 Oct 26: 373 duplicate expenses synced). A batchUpdate is
+        all-or-nothing across every tab in it, so a failure leaves the file as it was and
+        is raised. Deliberately not retried: if a call succeeded but its reply was lost, a
+        retry would delete the rows that moved up into those positions.
+        """
+        rows_by_tab = {tab: rows for tab, rows in rows_by_tab.items() if rows}
+        if not rows_by_tab: return
         sh = self.open(spreadsheet_url_or_id)
-        try: ws = sh.worksheet(tab_name)
-        except Exception: return
-        sorted_rows = sorted(list(set(row_indices)), reverse=True)
-        for row_num in sorted_rows:
-            try: ws.delete_rows(row_num)
-            except Exception: pass
+        requests_body = []
+        for tab_name, row_indices in rows_by_tab.items():
+            try: ws = sh.worksheet(tab_name)
+            except gspread.exceptions.WorksheetNotFound: continue
+
+            # Merge consecutive rows into ranges; bottom-up so no delete shifts a later one.
+            ranges: list[list[int]] = []
+            for row_num in sorted(set(int(r) for r in row_indices), reverse=True):
+                if ranges and ranges[-1][0] == row_num + 1:
+                    ranges[-1][0] = row_num
+                else:
+                    ranges.append([row_num, row_num])
+            requests_body += [
+                {"deleteDimension": {"range": {
+                    "sheetId": ws.id, "dimension": "ROWS", "startIndex": first - 1, "endIndex": last,
+                }}}
+                for first, last in ranges
+            ]
+        if requests_body:
+            sh.batch_update({"requests": requests_body})
 
     @retry_with_backoff()
     def cleanup_default_sheet(self, spreadsheet_url_or_id: str):

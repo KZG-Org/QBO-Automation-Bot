@@ -544,27 +544,63 @@ def _kzo_held_note(held: dict[int, tuple[int, set[int]]]) -> str:
     )
 
 
-def _get_sheet_rows_for_nos(
-    gs: GSheetsClient,
-    spreadsheet_url: str,
-    tab_name: str,
-    target_nos: set[int],
-) -> list[int]:
-    """Return sheet row numbers whose 'No' is in target_nos (for safe retry cleanup)."""
-    if not target_nos:
-        return []
-    try:
-        df = gs.read_as_df(spreadsheet_url, tab_name)
-    except Exception:
-        return []
+def _sheet_rows_for_nos(values: list[list] | None, target_nos: set[int]) -> list[int]:
+    """Sheet row numbers (header on row 1) whose 'No' is in target_nos, bottom-up."""
+    df = GSheetsClient.df_from_values(values or [])
     if df.empty or "No" not in df.columns:
         return []
+    nos = pd.to_numeric(df["No"], errors="coerce").fillna(-1).astype(int)
+    return sorted((int(i) + 2 for i in df.index[nos.isin(target_nos)]), reverse=True)
 
-    work_df = df.copy()
-    work_df["_sheet_row"] = work_df.index + 2
-    work_df["_no"] = pd.to_numeric(work_df["No"], errors="coerce").fillna(-1).astype(int)
-    rows = work_df[work_df["_no"].isin(target_nos)]["_sheet_row"].astype(int).unique().tolist()
-    return sorted(rows, reverse=True)
+
+def _delete_retry_rows(
+    gs: GSheetsClient,
+    spreadsheet_url: str,
+    tab_names: list[str],
+    retry_nos: set[int],
+) -> None:
+    """Step 11: delete every Transform row of the Nos being rebuilt, then prove they are gone.
+
+    The append guard (step 11b) lets retry Nos through only because their old rows were just
+    deleted; a surviving row becomes a second copy that sync posts (S5 Oct 26). So: reads go
+    through read_tab_values, which raises instead of returning an empty tab; all tabs go in
+    one all-or-nothing delete; and a fresh read must show none of the Nos. Any failure raises.
+    """
+    if not retry_nos:
+        return
+    rows_by_tab = {}
+    for tab_name in tab_names:
+        rows = _sheet_rows_for_nos(gs.read_tab_values(spreadsheet_url, tab_name), retry_nos)
+        if rows:
+            rows_by_tab[tab_name] = rows
+    if rows_by_tab:
+        gs.delete_rows_by_tab(spreadsheet_url, rows_by_tab)
+
+    left = set()
+    for tab_name in tab_names:
+        values = gs.read_tab_values(spreadsheet_url, tab_name)
+        df = GSheetsClient.df_from_values(values or [])
+        if not df.empty and "No" in df.columns:
+            nos = pd.to_numeric(df["No"], errors="coerce").dropna().astype(int)
+            left |= set(nos.tolist()) & retry_nos
+    if left:
+        raise RuntimeError(
+            f"{len(left)} ERROR row(s) were not deleted before the rebuild "
+            f"(Nos {_serialize_no_set(left)}); nothing appended, to avoid duplicates. "
+            f"Set Transform to READY again."
+        )
+
+
+def _pending_after_failed_retry(pending_from_control: set[int], retry_nos: set[int]) -> str:
+    """Pending Amount Nos to save when step 11 fails.
+
+    Some rows may already be gone (a delete whose reply was lost, or a failed check read).
+    Non-KZO clients never select a No below the checkpoint again unless it is ERROR or
+    pending, so listing the Nos here makes the next run rebuild any that are missing;
+    step 11b skips the ones still present.
+    """
+    return _serialize_no_set(set(pending_from_control) | set(retry_nos))
+
 
 def _reserve_journal_numbers(
     gs, control_sheet_id: str, ctrl_df: pd.DataFrame, row_num: int, last_journal_no: int, global_last_jv: int
@@ -1228,15 +1264,22 @@ def process_client_control_sheet(
                 for x in pd.to_numeric(retry_df.get("No"), errors="coerce").dropna().astype(int).tolist()
                 if int(x) > 0
             )
-            deletions = {}
-            if retry_selected_nos:
-                for tab_name in (tab_jv, tab_exp, tab_tr):
-                    rows = _get_sheet_rows_for_nos(gs, transform_url, tab_name, retry_selected_nos)
-                    if rows:
-                        deletions[tab_name] = rows
-            
-            # 11. Execute Deletions (Clean up bad rows before appending new ones)
-            for tab, rows in deletions.items(): gs.delete_rows(transform_url, tab, rows)
+            # 11. Execute Deletions (Clean up bad rows before appending new ones). On any
+            #     failure nothing is appended; the Nos join Pending Amount Nos so the next
+            #     run rebuilds whichever rows did get deleted.
+            try:
+                _delete_retry_rows(gs, transform_url, [tab_jv, tab_exp, tab_tr], retry_selected_nos)
+            except Exception:
+                pending_text = _pending_after_failed_retry(pending_nos_from_control, retry_selected_nos)
+                try:
+                    _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num,
+                                          ctrl_df.columns, {COL_PENDING_AMOUNT_NOS: pending_text})
+                except Exception as save_err:
+                    logger.error(
+                        f"   ❌ [{client_name}] Could not save Pending Amount Nos '{pending_text}': "
+                        f"{save_err}. Add them by hand before the next run."
+                    )
+                raise
 
             # 11b. Last line of defence: whatever the checkpoint said, a No still present in
             #      the Transform file after the deletions above is finished work. Appending it

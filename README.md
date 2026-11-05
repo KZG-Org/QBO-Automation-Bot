@@ -149,6 +149,39 @@ Consequences worth knowing:
   what catches this case. KZO is the exception: it re-creates a deleted row whose raw row is
   still ready (see [below](#kzo-ready-rows-below-the-checkpoint-are-still-picked-up)).
 
+#### ERROR retries: the old rows must be gone before the rebuild
+
+The retry path (step 11) deletes a row's old ERROR copy, then appends the rebuilt copy under
+the same Ref No. Step 11b lets retry `No`s through for exactly that reason, so if the delete
+fails, the run adds a second copy and sync posts both.
+
+S5 Oct 26 (4 Nov 2026) hit this. Rows were deleted one API call at a time and every failure
+was ignored. Retries of 392 and 360 rows ran past the Sheets write limit (about 60 per minute),
+so most deletes failed with no error. Each retry added another copy: 373 duplicate expenses
+and 1 duplicate transfer ($898,750.87) were synced to QBO. They were removed from QBO and the
+Transform file on 5 Nov 2026, keeping the first copy of each. The backup and delete log are
+kept outside git (`s5_oct_dup_cleanup/` on the operator's machine).
+
+Now:
+
+1. Step 11 (`_delete_retry_rows()`) reads all three Transform tabs with `read_tab_values()`,
+   which raises on an API error. The old read turned any error into an empty tab, so the
+   delete was skipped without a word.
+2. It deletes the rows of all three tabs in **one** `batchUpdate`
+   (`GSheetsClient.delete_rows_by_tab()`). Google applies all of it or none of it, so no tab
+   is left half done, and a failure is raised. It is not retried: if a delete worked but its
+   reply was lost, a retry would delete the rows that moved up.
+3. It reads the tabs again. If any retry `No` is still there, the row stops before
+   appending, with `Transform` = `ERROR` and the `No`s in the log.
+4. If any part of step 11 fails, the retry `No`s are added to `Pending Amount Nos`.
+   Some rows may already be gone (for example a delete whose reply was lost). KZP, KZDW, S5
+   and UMBER never select a `No` below the checkpoint again unless it is ERROR or pending,
+   so this makes the next run rebuild the missing ones. Step 11b skips any still there.
+   Set Transform to READY again to retry.
+
+The month-end JV path uses the same delete (`delete_rows()`, one tab). A failed delete there
+stops the row, and the next run rebuilds from the source tab's Status.
+
 #### Journal numbers are saved before the Transform write
 
 Journal numbers (`KZO-JV1418`, …) live nowhere but the Transform file until sync puts them in

@@ -13,6 +13,8 @@ from run_ingestion import (
     _kzo_held_note,
     _kzo_last_processed_formula,
     _kzo_missed_nos,
+    _delete_retry_rows,
+    _pending_after_failed_retry,
     format_month_name,
     get_transform_tab_state,
 )
@@ -281,6 +283,93 @@ class AlreadyTransformedNosTests(unittest.TestCase):
         self.assertEqual(
             _already_transformed_nos({8240001, 8240002}, {8170001}, retry_nos=set()),
             set(),
+        )
+
+
+class _FakeTransformFile:
+    """Transform tabs as cell grids (header on row 1). delete_rows_by_tab really removes rows,
+    unless `deletes_work` is False (a delete that reports success but leaves the rows)."""
+
+    def __init__(self, tabs, deletes_work=True, fail_read=None):
+        self.tabs = {name: [list(r) for r in grid] for name, grid in tabs.items()}
+        self.deletes_work = deletes_work
+        self.fail_read = fail_read
+        self.delete_calls = []
+
+    def read_tab_values(self, url, tab, value_render_option="FORMATTED_VALUE"):
+        if tab == self.fail_read:
+            raise RuntimeError("APIError 429: Quota exceeded")
+        if tab not in self.tabs:
+            return None
+        return [list(r) for r in self.tabs[tab]]
+
+    def delete_rows_by_tab(self, url, rows_by_tab):
+        self.delete_calls.append({tab: list(rows) for tab, rows in rows_by_tab.items()})
+        if self.deletes_work:
+            for tab, rows in rows_by_tab.items():
+                for row_num in sorted(rows, reverse=True):
+                    del self.tabs[tab][row_num - 1]
+
+
+class DeleteRetryRowsTests(unittest.TestCase):
+    """Retry Nos are exempt from the append guard only because their old rows were deleted.
+    S5 Oct 26: the deletes failed silently and each retry run added another copy."""
+
+    TABS = ["Journals", "Expenses", "Transfers"]
+
+    def _file(self, **kw):
+        return _FakeTransformFile({
+            "Journals": [["No", "Journal No"], ["1030007", "S5-JV0264"], ["1030007", "S5-JV0264"]],
+            "Expenses": [["No", "Exp Ref. No"], ["1030035", "E0207"], ["1099999", "E0999"], ["1030035", "E0207"]],
+            "Transfers": [["No", "Ref No"], ["1030384", "T0030"]],
+        }, **kw)
+
+    def test_every_tab_goes_in_one_delete_call(self):
+        f = self._file()
+
+        _delete_retry_rows(f, "url", self.TABS, {1030007, 1030035, 1030384})
+
+        # One call for all tabs: Sheets applies it all or not at all, so no tab is half done.
+        self.assertEqual(f.delete_calls, [{"Journals": [3, 2], "Expenses": [4, 2], "Transfers": [2]}])
+        self.assertEqual(f.tabs["Expenses"], [["No", "Exp Ref. No"], ["1099999", "E0999"]])
+        self.assertEqual(f.tabs["Journals"], [["No", "Journal No"]])
+
+    def test_raises_when_a_row_survives_the_delete(self):
+        f = self._file(deletes_work=False)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            _delete_retry_rows(f, "url", self.TABS, {1030035})
+        self.assertIn("1030035", str(ctx.exception))
+
+    def test_a_failed_read_raises_before_anything_is_deleted(self):
+        # read_as_df would have turned this into an empty tab and skipped the delete.
+        f = self._file(fail_read="Expenses")
+
+        with self.assertRaises(RuntimeError):
+            _delete_retry_rows(f, "url", self.TABS, {1030007, 1030035})
+        self.assertEqual(f.delete_calls, [])
+
+    def test_a_missing_tab_holds_nothing(self):
+        f = self._file()
+        del f.tabs["Transfers"]
+
+        _delete_retry_rows(f, "url", self.TABS, {1030035})
+
+        self.assertEqual(f.delete_calls, [{"Expenses": [4, 2]}])
+
+    def test_nothing_read_or_deleted_without_retry_nos(self):
+        f = self._file(fail_read="Expenses")  # any read would raise
+
+        _delete_retry_rows(f, "url", self.TABS, set())
+
+        self.assertEqual(f.delete_calls, [])
+
+    def test_failed_retry_nos_join_pending_amount_nos(self):
+        # Some rows may already be gone (lost reply). Pending Amount Nos makes the next run
+        # rebuild those; step 11b skips any still present.
+        self.assertEqual(
+            _pending_after_failed_retry({1013002}, {1030035, 1030007}),
+            "1013002;1030007;1030035",
         )
 
 
