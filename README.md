@@ -188,6 +188,24 @@ Now:
 The month-end JV path uses the same delete (`delete_rows()`, one tab). A failed delete there
 stops the row, and the next run rebuilds from the source tab's Status.
 
+#### Sync posts each Ref No once per run
+
+Before posting, sync asks QBO which Ref Nos already exist, once per tab. That check cannot
+see a Ref No posted a moment earlier in the same run, so if a Transform tab holds the same
+Ref No twice as "Ready to sync", both rows used to be posted (S5 Oct 26: 373 duplicate
+expenses). Now `run_syncing.py` remembers every Expense and Transfer Ref No it posts in the
+run (journals were already posted once per Journal No):
+
+| Second row with that Ref No | Remarks | Posted? |
+|---|---|---|
+| Same raw `No` (a copied row) | `Skipper (Duplicate row: … Delete this row.)` | No |
+| Different raw `No` (a reused Ref No, for example after a stale `Last Expense No`) | `Not posted: Ref No … was already used by No …` | No, so give it a new Ref No and mark it for sync again |
+
+Either case sets that tab's status to `SYNC FAIL` and `QBO Sync` to `PARTIAL ERROR`, so
+someone looks. Only a successful post counts: if the first copy failed, the next may post.
+The second text avoids the words ERROR and "Ready to sync", so the row is neither rebuilt by
+Transform nor picked up again by sync on its own.
+
 #### New rows are written below the last row, never over existing rows
 
 Transform rows used to be added with Sheets' "append", which guesses where a table ends. If

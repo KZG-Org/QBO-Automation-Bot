@@ -238,6 +238,30 @@ def _write_back_month_end_status(gs, row: pd.Series, synced_jvs: set[str]):
         logger.warning(f"   ⚠️ Month-end: could not update Status in '{tab_name}': {e}")
 
 
+def _no_text(value) -> str:
+    """A raw No as plain text ('1030035' whether the cell gave 1030035, 1030035.0 or '1030035')."""
+    try:
+        return str(int(float(str(value).replace(",", ""))))
+    except (TypeError, ValueError):
+        return str(value or "").strip()
+
+
+def _repeat_ref_remark(ref_no: str, row_no: str, first_no: str) -> str:
+    """Remarks for a row whose Ref No was already posted earlier in this same sync.
+
+    The QBO duplicate check runs once, before the batch, so it cannot see a Ref No posted a
+    moment ago: on S5 Oct 26 every copy of a duplicated row was posted. A copy of the same raw
+    row is skipped. A different raw row with the same Ref No (a stale counter) is held instead:
+    calling it "already synced" would lose a real transaction. Neither text contains ERROR or
+    the ready-to-sync marker, so the row is not rebuilt or re-synced on its own.
+    """
+    if row_no == first_no:
+        return (f"Skipper (Duplicate row: {ref_no} was already posted from another copy of "
+                f"No {row_no} in this sync. Delete this row.)")
+    return (f"Not posted: Ref No {ref_no} was already used by No {first_no} in this sync. "
+            f"Give this row (No {row_no}) a new Ref No and mark it for sync again.")
+
+
 def process_client_sync(
     gs: GSheetsClient,
     qbo_client: QBOClient,
@@ -404,6 +428,7 @@ def process_client_sync(
                     updater = AsyncSheetUpdater(gs, transform_url, tab_exp, col_ctx=col_ctx, batch_size=BATCH_SIZE)
                     section_fail = False
                     total_rows = len(to_sync)
+                    posted_refs: dict[str, str] = {}  # Ref No -> No, posted in this sync
 
                     # Use enumerate to track progress count
                     try:
@@ -412,9 +437,16 @@ def process_client_sync(
                                 logger.info(f"   [Expense {i+1}/{total_rows}] Processing Ref: {row_data.get('Exp Ref. No')}...")
 
                             ref_no = str(row_data.get("Exp Ref. No", ""))
-                            
+                            row_no = _no_text(row_data.get("No", ""))
+
                             # --- Logic: Check Duplicates ---
-                            if ref_no in existing_docs:
+                            if ref_no in posted_refs:
+                                msg = _repeat_ref_remark(ref_no, row_no, posted_refs[ref_no])
+                                logger.warning(f"      ⚠️ {msg}")
+                                updater.enqueue({"row_idx": idx, "status": msg, "qbo_id": "", "qbo_link": ""})
+                                has_error = True
+                                section_fail = True
+                            elif ref_no in existing_docs:
                                 already_synced_msg = f"Skipper (Already synced in QBO at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
                                 updater.enqueue({"row_idx": idx, "status": already_synced_msg, "qbo_id": "", "qbo_link": ""})
                             
@@ -422,6 +454,7 @@ def process_client_sync(
                             else:
                                 try:
                                     resp = sync_engine.push_expense(ref_no, row_data)
+                                    posted_refs[ref_no] = row_no
                                     _throttle_qbo_call()
                                     new_id = resp.get("Purchase", {}).get("Id", "")
                                     qbo_link = sync_engine.build_qbo_url("Purchase", new_id) if new_id else ""
@@ -472,6 +505,7 @@ def process_client_sync(
                     updater = AsyncSheetUpdater(gs, transform_url, tab_tr, col_ctx=col_ctx, batch_size=BATCH_SIZE)
                     section_fail = False
                     total_rows = len(to_sync)
+                    posted_refs: dict[str, str] = {}  # Ref No -> No, posted in this sync
 
                     try:
                         for i, (idx, row_data) in enumerate(to_sync.iterrows()):
@@ -479,13 +513,21 @@ def process_client_sync(
                                 logger.info(f"   [Transfer {i+1}/{total_rows}] Processing Ref: {row_data.get('Ref No')}...")
 
                             ref_no = str(row_data.get("Ref No", ""))
+                            row_no = _no_text(row_data.get("No", ""))
 
-                            if ref_no in existing_docs:
+                            if ref_no in posted_refs:
+                                msg = _repeat_ref_remark(ref_no, row_no, posted_refs[ref_no])
+                                logger.warning(f"      ⚠️ {msg}")
+                                updater.enqueue({"row_idx": idx, "status": msg, "qbo_id": "", "qbo_link": ""})
+                                has_error = True
+                                section_fail = True
+                            elif ref_no in existing_docs:
                                 already_synced_msg = f"Skipper (Already synced in QBO at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
                                 updater.enqueue({"row_idx": idx, "status": already_synced_msg, "qbo_id": "", "qbo_link": ""})
                             else:
                                 try:
                                     resp = sync_engine.push_transfer(row_data)
+                                    posted_refs[ref_no] = row_no
                                     _throttle_qbo_call()
                                     new_id = resp.get("Transfer", {}).get("Id", "")
                                     qbo_link = sync_engine.build_qbo_url("Transfer", new_id) if new_id else ""
