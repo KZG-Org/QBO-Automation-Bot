@@ -3,35 +3,32 @@ from unittest.mock import MagicMock
 
 import pandas as pd
 
-from config import settings
 from run_ingestion import (
     _abs_amounts_by_no,
     _already_transformed_nos,
-    _control_cell_ref,
+    _checkpoint_for_run,
     _heal_last_processed,
-    _kzo_checkpoint_cell,
     _kzo_held_note,
-    _kzo_last_processed_formula,
     _kzo_missed_nos,
     _delete_retry_rows,
     _pending_after_failed_retry,
-    format_month_name,
     get_transform_tab_state,
 )
 
-# Control tab header order, as laid out in the live JOBS CONTROL sheet.
-CONTROL_COLUMNS = [
-    "Client", "Country", "Month", "Last Month Date", "Source File", "Transform File",
-    "Tab Name", "Transform", "QBO Sync", "Last Journal No", "Last Expense No",
-    "Last Processed Row",
-]
-
 
 def _gs_with_tab(rows, columns=None):
-    """A GSheetsClient stub whose single tab holds `rows`."""
+    """A GSheetsClient stub whose single tab holds `rows` (no rows = the tab does not exist).
+
+    The tab is served as a raw cell grid through read_tab_values, which raises on API errors,
+    exactly like the real client.
+    """
     gs = MagicMock()
-    df = pd.DataFrame(rows, columns=columns) if rows else pd.DataFrame()
-    gs.read_as_df.return_value = df
+    if not rows:
+        gs.read_tab_values.return_value = None
+        return gs
+    df = pd.DataFrame(rows, columns=columns)
+    grid = [list(df.columns)] + [["" if pd.isna(v) else str(v) for v in r] for r in df.itertuples(index=False)]
+    gs.read_tab_values.return_value = grid
     return gs
 
 
@@ -82,6 +79,15 @@ class TransformTabStateTests(unittest.TestCase):
     def test_missing_tab_reports_nothing_present(self):
         _, _, present, _ = get_transform_tab_state(_gs_with_tab([]), "url", "missing", "Ref No")
         self.assertEqual(present, set())
+
+    def test_a_failed_read_stops_the_row_instead_of_reading_as_empty(self):
+        # An empty answer would mean "nothing transformed yet": KZO's checkpoint would drop to
+        # 0 and every ready row of the month would be transformed and posted again.
+        gs = MagicMock()
+        gs.read_tab_values.side_effect = RuntimeError("APIError 429: Quota exceeded")
+
+        with self.assertRaises(RuntimeError):
+            get_transform_tab_state(gs, "url", "TH Oct 26 - Expenses", "Exp Ref. No")
 
     def test_tab_without_a_no_column_reports_nothing_present(self):
         gs = _gs_with_tab([{"Ref No": "X", "Remarks": "Ready to sync"}])
@@ -373,51 +379,28 @@ class DeleteRetryRowsTests(unittest.TestCase):
         )
 
 
-class KzoCheckpointFormulaTests(unittest.TestCase):
-    """KZO stores 'Last Processed Row' as a live formula over its Transform tabs."""
+class CheckpointForRunTests(unittest.TestCase):
+    """KZO's 'Last Processed Row' is the highest No in its Transform file, worked out at the
+    start of every run (it replaced a live IMPORTRANGE formula that needed one approval per
+    monthly file). Other clients keep the cell, only ever moved forward."""
 
-    def test_transform_file_column_resolves_to_its_a1_ref(self):
-        # 'Transform File' is column F in the live control sheet.
-        self.assertEqual(
-            _control_cell_ref(CONTROL_COLUMNS, settings.CTRL_COL_TRANSFORM_URL, 54), "F54"
-        )
-        self.assertEqual(
-            _control_cell_ref(CONTROL_COLUMNS, settings.CTRL_COL_TRANSFORM_URL, 53), "F53"
-        )
+    def test_kzo_follows_the_transform_file_up(self):
+        self.assertEqual(_checkpoint_for_run(9250010, {9250010, 9270036}, is_kzo=True), 9270036)
 
-    def test_missing_column_has_no_ref(self):
-        self.assertIsNone(_control_cell_ref(["Country"], settings.CTRL_COL_TRANSFORM_URL, 54))
+    def test_kzo_follows_the_transform_file_down_when_rows_were_deleted(self):
+        # Rows 9260001..9270036 were deleted from the Transform file: they must be new again.
+        self.assertEqual(_checkpoint_for_run(9270036, {9100001, 9250010}, is_kzo=True), 9250010)
 
-    def test_formula_reads_all_three_tabs_of_the_row_month(self):
-        formula = _kzo_last_processed_formula("F54", "PH Aug 26")
+    def test_kzo_empty_transform_file_starts_from_zero(self):
+        self.assertEqual(_checkpoint_for_run(9270036, set(), is_kzo=True), 0)
 
-        self.assertTrue(formula.startswith("=IFERROR(MAX(UNIQUE(VSTACK("))
-        for tab in ("Journals", "Expenses", "Transfers"):
-            self.assertIn(f'IMPORTRANGE(F54, "PH Aug 26 - {tab}!A2:A")', formula)
-        # Every range is guarded, so a tab that does not exist yet reads 0, not #REF!.
-        self.assertEqual(formula.count("IFERROR("), 4)
+    def test_kzo_ignores_an_unreadable_cell(self):
+        # An old formula cell may still read #REF! (parsed as 0) until its first run.
+        self.assertEqual(_checkpoint_for_run(0, {9250010}, is_kzo=True), 9250010)
 
-    def test_tab_names_follow_the_month_and_year(self):
-        # The prefix comes from the row's own Country + Month, so Sep and a year roll are
-        # picked up with no edit to the formula.
-        self.assertEqual(format_month_name("2026-09-01"), "Sep 26")
-        self.assertEqual(format_month_name("2027-01-01"), "Jan 27")
-        self.assertIn(
-            'IMPORTRANGE(F60, "PH Jan 27 - Journals!A2:A")',
-            _kzo_last_processed_formula("F60", "PH Jan 27"),
-        )
-
-    def test_kzo_gets_the_formula_and_others_keep_the_number(self):
-        kzo = _kzo_checkpoint_cell(True, CONTROL_COLUMNS, 54, "PH Aug 26", 8230025)
-        other = _kzo_checkpoint_cell(False, CONTROL_COLUMNS, 7, "TH Aug 26", 8230146)
-
-        self.assertTrue(str(kzo).startswith("="))
-        self.assertEqual(other, 8230146)  # KZP / S5 / UMBER / KZDW keep the snapshot
-
-    def test_falls_back_to_the_number_without_a_transform_file_column(self):
-        self.assertEqual(
-            _kzo_checkpoint_cell(True, ["Country", "Month"], 54, "PH Aug 26", 8230025), 8230025
-        )
+    def test_other_clients_only_move_forward(self):
+        self.assertEqual(_checkpoint_for_run(1031005, {1030388}, is_kzo=False), 1031005)
+        self.assertEqual(_checkpoint_for_run(1025004, {1031005}, is_kzo=False), 1031005)
 
 
 if __name__ == "__main__":

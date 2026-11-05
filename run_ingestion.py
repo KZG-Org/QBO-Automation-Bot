@@ -36,7 +36,6 @@ from src.logic.month_end import (
     transform_note,
 )
 from src.utils.run_lock import single_instance_lock
-from gspread.utils import rowcol_to_a1
 
 logger = setup_logger("ingestion")
 
@@ -207,56 +206,20 @@ def _serialize_no_set(vals: set[int]) -> str:
         return ""
     return ";".join(str(x) for x in sorted(vals))
 
-def _control_cell_ref(columns, col_name: str, row_num: int) -> str | None:
-    """A1 reference of `col_name` on `row_num` of the control tab (e.g. 'F54')."""
-    headers = list(columns)
-    if col_name not in headers:
-        return None
-    return rowcol_to_a1(row_num, headers.index(col_name) + 1)
+def _checkpoint_for_run(last_processed: int, transformed_nos: set[int], is_kzo: bool) -> int:
+    """The checkpoint ('Last Processed Row') this run selects new rows against.
 
+    KZO: exactly the highest No in the month's Transform tabs, read at the start of the run,
+    even when that is lower than the cell. Rows deleted from the Transform file then count as
+    new again (step 10d covers ones below the top). This is what the old IMPORTRANGE formula
+    showed, without its one-time link approval for every monthly Transform file.
 
-# The 'No' the transformer writes is column A of every Transform tab (Journals, Expenses and
-# Transfers all start with it), which is what the formula below reads.
-TRANSFORM_NO_COLUMN_RANGE = "A2:A"
-
-
-def _kzo_last_processed_formula(transform_url_ref: str, tab_prefix: str) -> str:
-    """Live 'Last Processed Row' for KZO: max raw No across the month's three Transform tabs.
-
-    Stored as a formula rather than a snapshot so the checkpoint tracks the Transform file
-    itself. A run that appends rows and then dies before step 15 no longer leaves the cell
-    behind reality, because the cell was never the record in the first place.
-
-    Each IMPORTRANGE is wrapped in IFERROR so a month whose tabs do not all exist yet (or an
-    IMPORTRANGE link still awaiting its one-time approval) reads 0 instead of poisoning the
-    whole formula with #REF!. A 0 is safe: `_heal_last_processed` then recovers the real
-    checkpoint from the tabs directly, and step 11b refuses to append anything already there.
+    Others (KZP / KZDW / S5 / UMBER): the cell, moved forward to cover the Transform file and
+    never back (see _heal_last_processed).
     """
-    ranges = ", ".join(
-        f'IFERROR(IMPORTRANGE({transform_url_ref}, "{tab_prefix} - {tab}!{TRANSFORM_NO_COLUMN_RANGE}"), 0)'
-        for tab in ("Journals", "Expenses", "Transfers")
-    )
-    return f"=IFERROR(MAX(UNIQUE(VSTACK({ranges}))), 0)"
-
-
-def _kzo_checkpoint_cell(
-    is_kzo_client: bool,
-    columns,
-    row_num: int,
-    tab_prefix: str,
-    fallback,
-):
-    """What to write into 'Last Processed Row': KZO's live formula, else the snapshot.
-
-    Returns `fallback` for non-KZO clients, or when the control tab has no Transform File
-    column to point IMPORTRANGE at.
-    """
-    if not is_kzo_client:
-        return fallback
-    transform_cell = _control_cell_ref(columns, settings.CTRL_COL_TRANSFORM_URL, row_num)
-    if not transform_cell:
-        return fallback
-    return _kzo_last_processed_formula(transform_cell, tab_prefix)
+    if is_kzo:
+        return max(transformed_nos, default=0)
+    return _heal_last_processed(last_processed, transformed_nos)
 
 
 def _decode_kzo_no(no_val: int, expected_month: int | None) -> str | None:
@@ -383,8 +346,11 @@ def get_transform_tab_state(
     trust it over the checkpoint cell.
     """
     try:
-        # Use read_as_df to keep row positions aligned with sheet rows.
-        df = gs.read_as_df(spreadsheet_url, tab_name)
+        # read_tab_values raises on API errors (None only for a tab that does not exist yet).
+        # read_as_df turned any failure into an empty tab, which here means "nothing
+        # transformed": KZO's checkpoint would fall to 0 and the month would be posted again.
+        # df_from_values keeps row positions aligned with sheet rows.
+        df = GSheetsClient.df_from_values(gs.read_tab_values(spreadsheet_url, tab_name) or [])
         if df.empty or "No" not in df.columns:
             return [], {}, set(), {}
 
@@ -933,8 +899,7 @@ def process_client_control_sheet(
                 logger.warning(
                     f"   ⚠️ [{client_name}] '{settings.CTRL_COL_LAST_PROCESSED_ROW}' did not parse as "
                     f"a number (value: {str(last_processed_raw).strip()!r}); treating it as 0 and "
-                    f"recovering the checkpoint from the Transform file. If that is #REF!, the "
-                    f"IMPORTRANGE link needs its one-time approval in the control sheet."
+                    f"recovering the checkpoint from the Transform file."
                 )
             
             # Fetch latest QBO Journal No to prevent overlap. Same prefix the transformer
@@ -1014,8 +979,10 @@ def process_client_control_sheet(
             #     that window left the work done but the cell stale -- and every one of those
             #     rows would look new again here and be transformed a second time under a
             #     fresh Ref No. Same effect if the cell was rewound by hand. The Transform
-            #     file is the record of truth, so the checkpoint only moves forward.
-            healed_last_processed = _heal_last_processed(last_processed, transformed_nos)
+            #     file is the record of truth: other clients' checkpoint only moves forward;
+            #     KZO's is exactly the Transform file's highest No, so rows deleted from it are
+            #     new again. KZO writes it to the cell now, before anything is transformed.
+            healed_last_processed = _checkpoint_for_run(last_processed, transformed_nos, is_kzo_client)
             if healed_last_processed > last_processed:
                 logger.warning(
                     f"   ⚠️ [{client_name}] '{settings.CTRL_COL_LAST_PROCESSED_ROW}' "
@@ -1024,8 +991,20 @@ def process_client_control_sheet(
                     f"checkpoint, or the cell was edited. Using {healed_last_processed} so "
                     f"those rows are not transformed twice."
                 )
+            elif healed_last_processed < last_processed:
+                logger.warning(
+                    f"   ⚠️ [{client_name}] '{settings.CTRL_COL_LAST_PROCESSED_ROW}' "
+                    f"({last_processed}) is ahead of the Transform file (max No "
+                    f"{healed_last_processed}): rows were deleted from it. Using "
+                    f"{healed_last_processed} so ready rows above it are transformed again."
+                )
+            if healed_last_processed != last_processed:
                 last_processed = healed_last_processed
                 previous_pending_nos = _cap_pending_nos(pending_nos_from_control, last_processed)
+            if is_kzo_client:
+                _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, {
+                    settings.CTRL_COL_LAST_PROCESSED_ROW: last_processed,
+                })
 
             # 6. Read & Clean Source Data
             raw_df = _read_source_raw_df(
@@ -1248,13 +1227,10 @@ def process_client_control_sheet(
                     settings.CTRL_COL_TRANSFORM_NOTE: "",  # clears an earlier No-column message
                     settings.CTRL_COL_ACTIVE: "DONE"
                 }
-                # Install/repair KZO's live checkpoint formula even on a run with nothing to
-                # transform, so it does not wait for the next batch to appear.
-                idle_checkpoint = _kzo_checkpoint_cell(
-                    is_kzo_client, ctrl_df.columns, row_num, tab_prefix, None
-                )
-                if idle_checkpoint is not None:
-                    idle_updates[settings.CTRL_COL_LAST_PROCESSED_ROW] = idle_checkpoint
+                # KZO: the checkpoint read from the Transform file at step 5b (this also
+                # replaces an old IMPORTRANGE formula still sitting in the cell).
+                if is_kzo_client:
+                    idle_updates[settings.CTRL_COL_LAST_PROCESSED_ROW] = last_processed
                 _batch_update_control(gs, control_sheet_id, settings.CONTROL_TAB_NAME, row_num, ctrl_df.columns, idle_updates)
                 continue
 
@@ -1365,14 +1341,10 @@ def process_client_control_sheet(
             # 15. Final Updates to Control Sheet
             final_last_row = max(last_processed, result.max_row_processed) if result.max_row_processed else last_processed
             pending_to_write = _cap_pending_nos(current_pending_nos, final_last_row)
-            # KZO stores the checkpoint as a live formula over the Transform tabs rather than
-            # the number this run happened to reach; everyone else keeps the snapshot.
-            last_processed_cell = _kzo_checkpoint_cell(
-                is_kzo_client, ctrl_df.columns, row_num, tab_prefix, final_last_row
-            )
-
+            # A plain number for every client. KZO's equals the Transform file's highest No
+            # after this run's append (step 5b's value plus what was just added).
             updates = {
-                settings.CTRL_COL_LAST_PROCESSED_ROW: last_processed_cell,
+                settings.CTRL_COL_LAST_PROCESSED_ROW: final_last_row,
                 COL_LAST_EXP: result.last_expense_no,
                 COL_LAST_TR: result.last_withdraw_no,
                 COL_PENDING_AMOUNT_NOS: _serialize_no_set(pending_to_write), # <-- ADDED

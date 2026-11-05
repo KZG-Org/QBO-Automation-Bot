@@ -130,7 +130,13 @@ Two guards, both in `run_ingestion.py`:
 1. **Checkpoint self-heal** (step 5b). Each Transform tab is read once anyway for the retry
    context, so that read also reports every `No` the tab already holds. `_heal_last_processed()`
    raises the checkpoint to `max(cell, max(No in Transform file))`. It only ever moves
-   **forward**, and logs a warning naming both values when it corrects one.
+   **forward**, and logs a warning naming both values when it corrects one. **KZO is
+   different:** its checkpoint is exactly the Transform file's highest `No`, so it can also go
+   down (see [below](#kzo-last-processed-row-follows-the-transform-file)).
+   The Transform tabs are read with `read_tab_values()`: a read that fails (a Google quota
+   error, for example) stops the row with `Transform` = `ERROR`. It is never read as an empty
+   tab, because "empty" means "nothing transformed yet" and the month would be posted again.
+   A tab that does not exist yet (a new month) is empty, which is correct.
 2. **Append guard** (step 11b). After the ERROR-retry deletions, `_already_transformed_nos()`
    drops from the batch any `No` still present in the Transform file. Retry `No`s are exempt —
    their rows were just deleted, so rebuilding them is the intent. Skipped `No`s are logged and
@@ -142,8 +148,8 @@ Consequences worth knowing:
   the way it appeared to — it duplicated rather than rebuilt. To rebuild a row on purpose, put
   `ERROR` in its Transform row's `Remarks`: the retry path deletes that row and re-creates it
   under the **same** Ref No.
-- The guards only move the checkpoint forward, so they cannot recover rows **deleted** from the
-  Transform file while the checkpoint stayed high — those are silently behind the checkpoint and
+- For KZP / KZDW / S5 / UMBER the guards only move the checkpoint forward, so they cannot
+  recover rows **deleted** from the Transform file while the checkpoint stayed high — those are silently behind the checkpoint and
   will never be rebuilt. If you delete Transform rows, lower `Last Processed Row` to the highest
   `No` you kept, then re-run. The raw-vs-transform reconciliation ("possibly skipped rows") is
   what catches this case. KZO is the exception: it re-creates a deleted row whose raw row is
@@ -182,6 +188,19 @@ Now:
 The month-end JV path uses the same delete (`delete_rows()`, one tab). A failed delete there
 stops the row, and the next run rebuilds from the source tab's Status.
 
+#### New rows are written below the last row, never over existing rows
+
+Transform rows used to be added with Sheets' "append", which guesses where a table ends. If
+it guesses too early (for example a blank row inside the tab), it writes the new rows **over**
+the rows after that point. S5 Oct 26 hit this twice: T0030 landed in the middle of Transfers
+(4 Nov), and JV0267 replaced two existing journal lines (5 Nov; QBO was right, the two lines
+were restored in the sheet).
+
+`GSheetsClient.append_or_create_df()` now reads the tab, takes the last row that holds any
+value (blank rows inside count), adds grid rows if the tab is full, and writes the new rows
+directly below it. Nothing above that row is ever written. All clients and the month-end JV
+path use it.
+
 #### Journal numbers are saved before the Transform write
 
 Journal numbers (`KZO-JV1418`, …) live nowhere but the Transform file until sync puts them in
@@ -198,44 +217,25 @@ Now step 12b (`_reserve_journal_numbers()`) writes `Last Journal No` right after
 before anything else, and carries the counter to the next row of the run. An interrupted run
 can leave a gap in the numbers, never a reused one. Expense and Transfer counters are unchanged.
 
-#### KZO: `Last Processed Row` is a live formula
+#### KZO: `Last Processed Row` follows the Transform file
 
-For **KZO only**, the pipeline writes a formula into `Last Processed Row` instead of the number
-the run happened to reach, so the cell reads the Transform file rather than remembering it:
+For **KZO only**, `Last Processed Row` is always the highest `No` in that month's three
+Transform tabs (Journals, Expenses, Transfers). The bot works it out from the Transform file:
 
-```
-=IFERROR(MAX(UNIQUE(VSTACK(
-  IFERROR(IMPORTRANGE(F54, "PH Aug 26 - Journals!A2:A"),  0),
-  IFERROR(IMPORTRANGE(F54, "PH Aug 26 - Expenses!A2:A"),  0),
-  IFERROR(IMPORTRANGE(F54, "PH Aug 26 - Transfers!A2:A"), 0)
-))), 0)
-```
+- **Before transforming** (step 5b): the tabs are read for the retry context anyway; their
+  highest `No` becomes the checkpoint and is written to the cell straight away. It can go
+  **down**: if Transform rows were deleted, their ready raw rows count as new again (and
+  step 10d picks up deleted rows below the top). The log says when the cell was ahead of or
+  behind the Transform file.
+- **After the run** (step 15, or the idle path when nothing was transformed): the new
+  highest `No`, as a plain number.
 
-Written on every run (including runs with nothing to transform), so it installs and repairs
-itself — no manual formula maintenance per month. Both parts are derived from the row:
+Until 5 Nov 2026 the cell held an `IMPORTRANGE` formula doing the same thing. It needed a
+one-time "Allow access" for every new monthly Transform file, and was cached for a few
+minutes. It is gone: each row's next run replaces the formula with the number, so no approval
+is needed. The cell's old value is ignored for KZO; a `#REF!` there does no harm.
 
-- `F54` — the `Transform File` cell of *this* control row, from the header position and row
-  number, so it follows column moves and row inserts.
-- `PH Aug 26` — the row's own `Country` + `Month`, formatted `%b %y`. September 2027 becomes
-  `PH Sep 27` with no edit.
-- `A2:A` is the `No` column: all three Transform tabs start with it.
-
-Each `IMPORTRANGE` is wrapped in `IFERROR` so a month whose tabs don't all exist yet reads `0`
-rather than poisoning the whole formula with `#REF!`. A `0` is safe — the self-heal above
-recovers the real checkpoint straight from the tabs and step 11b still refuses to re-append
-anything already there. A non-numeric checkpoint cell is logged as a warning naming the value.
-
-Two things to know:
-
-- **The first run against a new month's Transform file returns `#REF!` until someone opens the
-  control sheet and approves the IMPORTRANGE link once.** That approval is per
-  (source, destination) pair, so each new monthly Transform file needs it. Until then the row
-  falls back to the Transform-file scan, which is correct but does an extra read.
-- `IMPORTRANGE` results are cached for a few minutes, so back-to-back runs can see a stale
-  value. Harmless here: the checkpoint is only ever a hint, and the two guards above decide
-  what actually gets appended.
-
-Other clients (KZP / S5 / UMBER / KZDW) keep the plain number.
+Other clients (KZP / S5 / UMBER / KZDW) keep the plain number, moved forward only.
 
 #### KZO: ready rows below the checkpoint are still picked up
 

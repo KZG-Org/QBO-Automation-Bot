@@ -340,4 +340,13 @@ class GSheetsClient:
                 ws.update("A1", values)
                 return
 
-        ws.append_rows(data_values, value_input_option="USER_ENTERED")
+        # Write straight below the last row holding anything. Sheets' append guesses a "table"
+        # and, if it ends early (a blank row inside), writes over the rows after it: S5 Oct 26
+        # lost two journal lines that way. get_all_values() ends at the last used row and
+        # keeps blank rows inside; the scan also gives 0 for a fully empty tab ([[]]).
+        grid = ws.get_all_values()
+        last_row = max((i + 1 for i, r in enumerate(grid) if any(str(c).strip() for c in r)), default=0)
+        missing = last_row + len(data_values) - ws.row_count
+        if missing > 0:
+            ws.add_rows(missing)
+        ws.update(range_name=f"A{last_row + 1}", values=data_values, value_input_option="USER_ENTERED")
