@@ -444,19 +444,21 @@ exact matches are handed out first, so a line QBO really has is always `✅ Matc
 
 ### Account matching: no fuzzy guessing for accounts
 
-Account names from the sheet are resolved against QBO by **exact match**, then **suffix-path
-match**, plus the hardcoded `replacements` table for known aliases. There is **no fuzzy
-fallback for accounts** — if none match, the row fails with
-`ERROR | Account not found: '<name>'` in `Remarks` and is never synced.
+Account names from the sheet are resolved against QBO in this order (full detail in the next
+section, "Account Map tab"):
 
-The `replacements` table holds one rule: `CBD Z Card` -> `KZO CBD Z`. It is the same in
-`transformer.py`, `syncing.py` and `reconciler.py`. A rule rewrites the sheet name **before**
-the lookup, so when someone renames the account in QBO, the rule must be removed or changed
-the same day, or every row with that name fails `Account not found`.
+1. a **Manual** row in the client's `Account Map` tab;
+2. the **exact** QBO name today, then a **suffix-path** match;
+3. the account this sheet name used **before** (an **Auto** row), which covers a QBO rename;
+4. otherwise the row fails with `ERROR | Account not found: '<name>'. Closest in QBO: ... Fix the
+   name or add it to the Account Map tab` in `Remarks` and is never synced.
 
-Removed on 2026-11-18: `Leading Card MKT - 1238` -> `Leading Card - 1238`. QBO renamed
-account 11191 to `Leading Card MKT - 1238`, so the rule sent every row to a name QBO no
-longer had. The sheet name now matches QBO directly.
+There is **no fuzzy fallback for accounts** anywhere: not at Transform, not at Sync, not at
+Reconcile. The closest QBO names appear in the message only.
+
+The old hardcoded rewrites are gone (2026-11-18): `CBD Z Card` -> `KZO CBD Z` and
+`Leading Card MKT - 1238` -> `Leading Card - 1238`. Both pointed at names QBO no longer has after
+renames, so they made rows fail instead of helping. A rename is now handled by the Account Map tab.
 
 Suffix-path matching compares the sheet value against *every trailing path* of the QBO
 fully-qualified name, so a sheet value may drop any number of leading parent levels:
@@ -471,9 +473,9 @@ analysts write either one. A bare middle fragment (`RnD`) is deliberately **not*
 
 If one name resolves to **two different accounts** under different parents (e.g.
 `Marketing:Growth` and `Sales:Growth` for a sheet value of `Growth`), accounts **refuse** and
-report `AMBIGUOUS` rather than pick one — same reasoning as the fuzzy ban below. KZO's current
-chart of accounts has no such collisions; KZP's does, and resolves it with the alias table
-described in the next section.
+report `AMBIGUOUS` rather than pick one — same reasoning as the fuzzy ban below. If the
+Account Map holds an Auto row for that name pointing at one of the two, that account is used.
+KZP resolves its `Growth` pair with the alias table described below.
 
 This is deliberate. A real chart of accounts contains siblings that differ only by a short
 code — KZO has `Investment in HR Company`, `(MP)`, `(OSR)` and `(ORZ)` (71002/71006/71004/71009).
@@ -482,9 +484,14 @@ old 0.80 fuzzy cutoff, so a missing or mistyped account was silently booked to w
 sibling happened to be closest. A loud failure a human fixes in the sheet beats a wrong
 posting nobody notices.
 
+The 2026-11-18 audit of all 6 companies found the same risk everywhere: UMBER has
+`Retained Earning` and `Retained Earnings` as 2 accounts, and `Amount Owing by/(to) - KZO group`
+next to `Amount Owing by/(to) KZO group`; KZO has 740 pairs of different accounts that are 80% or
+more alike (`KZO COY TRC 4` / `KZO COY TRC 4A`). So no "looser" rule (plural `s`, punctuation,
+card numbers) was added.
+
 Fuzzy matching is still used for **vendors, classes, locations and payment methods**, where
-names genuinely vary and a near-miss does not misstate the books. A failed account lookup logs
-the closest QBO names as a hint, but never selects one.
+names genuinely vary and a near-miss does not misstate the books.
 
 #### KZP only: the duplicated `Growth` account
 
@@ -510,26 +517,83 @@ Rules:
   the sub-category hint stays visible to a human reading either sheet.
 - The alias target is still a *name*, so it goes through normal exact + suffix-path matching
   afterwards. If QBO nests the pair deeper (`Income:Marketing Income:Growth`), it keeps working.
-- For an aliased account, the **reconciler drops its fuzzy fallback** and requires an exact or
-  suffix-path match. `Marketing Income:Growth` scores **0.81** against `Marketing Expense:Growth`,
-  so the fuzzy check would have passed the exact wrong-parent posting the alias exists to catch.
-  The one exception: when QBO reports a **bare** account name (no `:` path) the payload carries
-  no parent to compare, so the reconciler falls back to a leaf comparison rather than raise a
-  mismatch it cannot prove.
 - Anything else — accounts not in the table, other clients — is untouched.
 
-The table lives in `src/logic/account_aliases.py` (`KZP_ACCOUNT_ALIASES`), shared by all three
-matchers. Add a new collision there rather than loosening a matcher.
+The table lives in `src/logic/account_aliases.py` (`KZP_ACCOUNT_ALIASES`) and runs before the
+Account Map. Add a new collision there rather than loosening the matcher.
 
-Implemented as `allow_fuzzy` in `find_id_in_map` (`src/logic/transformer.py`) and a
-`mapping_key != "accounts"` guard in `QBOSync.find_id` (`src/logic/syncing.py`), with a third
-copy in `Reconciler._is_account_match` (`src/logic/reconciler.py`). The three matchers are
-intentional duplicates — change them together. Only the alias table is shared
-(`src/logic/account_aliases.py`).
+All stages use **one resolver**, `AccountResolver` in `src/logic/account_map.py`: Transform
+(`transformer.py`, `month_end.py`), Sync (`QBOSync.find_id`) and Reconcile. The three separate
+copies that existed before 2026-11-18 are gone.
 
-Note the sync log only prints `[Sync Map]` for a **suffix/leaf** match. An exact match is
-silent by design, so a section with no `[Sync Map]` lines means every account matched exactly —
-typically transfers, whose bank accounts sit at the top level of the chart.
+Note the sync log prints `[Sync Map]` only when an account did **not** match its exact name
+(`SUFFIX`, `SAVED`, `MANUAL`). A section with no `[Sync Map]` lines means every account matched
+exactly.
+
+### Account Map tab
+
+Each client's Control Sheet (the spreadsheet that holds `JOBS CONTROL`) has a tab named
+`Account Map`. It links a sheet account name to a QBO account, so a renamed QBO account keeps
+working and the team can fix a name without a code change.
+
+| Column | Filled by | Meaning |
+|---|---|---|
+| `Sheet Name` | bot or team | The account text as written in the sheet. Upper/lower case and extra spaces do not matter. |
+| `QBO Account` | bot or team | The QBO account name. Type it for a Manual row. |
+| `QBO ID` | bot | The QBO account Id. Leave it blank; the bot fills it. |
+| `Type` | bot or team | `Auto` = the bot learned it. `Manual` = the team set it. Blank counts as `Manual`. |
+| `Realm ID` | bot | The QBO company the Id belongs to. |
+| `Updated At` | bot | When the bot last wrote the row. |
+
+How the bot picks the account for one sheet name:
+
+1. **Manual row** with this Sheet Name: its `QBO Account` name today. If that name is gone from
+   QBO (renamed), the row's saved `QBO ID`.
+2. **Exact QBO name** today (full name, or the name without its parent levels). The bot saves it
+   as an Auto row.
+3. **Auto row** with this Sheet Name: its saved `QBO ID`. This is the rename case: the bot logs
+   `[Account Map] '<name>' is not in QBO any more; using saved account <Id> now named '<new name>'`
+   and writes the new name into `QBO Account`.
+4. Nothing found: `ERROR | ... not in QBO: '<name>'. Closest in QBO: '<a>', '<b>'. Fix the name or
+   add it to the Account Map tab`.
+
+To send a sheet name to an account yourself, add a row: type `Sheet Name` and `QBO Account`
+(the name as QBO shows it), leave the other cells blank, then run Transform again. A Manual row
+wins over everything else. The bot never changes the `Sheet Name`, `QBO Account` or `Type` you
+typed.
+
+Errors and what to do:
+
+| Remarks says | Do this |
+|---|---|
+| `... not in QBO: 'X'. Closest in QBO: ...` | Fix the name in the source sheet, or add a Manual row for `X`. |
+| `Matches more than one QBO account: ...` | Add a Manual row that names the right account. |
+| `Account Map row for 'X' points to 'Y', which is not in QBO` | Fix `QBO Account` in that row. |
+
+Rules:
+
+- **Only Transform writes the tab**, once at the end of each client run, and only new or changed
+  rows. It reads the tab again just before writing and matches rows by `Sheet Name`, so sorting
+  or inserting rows while it runs is safe. Sync and Reconcile only read it.
+- A `QBO ID` counts only for the company in its `Realm ID`. A tab copied from another company's
+  Control Sheet does not post to that company's accounts.
+- If the tab cannot be read (for example a Sheets quota error), that client's Transform, Sync or
+  Reconcile run stops and logs `Cannot read the Account Map tab`. A missing tab is fine: the bot
+  creates it on the first Transform.
+- **Reconcile** compares accounts by QBO Id, not by name. A sibling account (`TRC 4` vs
+  `TRC 4A`) now shows `❌ Account Mismatch`; it used to pass as an 80% fuzzy match. Expenses check
+  `Account (Cr)` the same way (`Payment Account Mismatch` / `Payment Account not found`).
+  Transfers still check amount and date only.
+- Known Reconcile limits (shown as a mismatch, never a wrong posting): a sheet name the bot never
+  saw before its account was renamed shows `Account not found`; if QBO later gives a name to a
+  different account, older rows with that name show a mismatch.
+
+The tab was filled on 2026-11-18 by `seed_account_map.py` (one-off; prints the plan, writes only
+with `--write`). It took every account name from every month in each Control Sheet: names that
+match QBO today became Auto rows, and renamed names were learned from the account their synced
+transactions actually posted to. Names whose rows posted to 2 different accounts (for example
+KZO `Leading Card ACC`) were left out and need a Manual row. Design:
+`docs/superpowers/specs/2026-11-18-account-map-design.md`.
 
 ### Transfer duplicate check is scoped by month
 
@@ -559,15 +623,15 @@ QBO rejects a transfer whose two sides resolve to one account, and its answer is
 can fail this way — journals and expenses have no equivalent constraint.
 
 Blocking identical *text* is not enough: two different names can resolve to the same QBO
-account through the explicit replacements (`CBD Z Card` -> `KZO CBD Z`) or through a leaf name
-matching a sub-account. The check therefore compares the **resolved account Ids**, and runs at
+account through an Account Map row or through a leaf name matching a sub-account
+(`KZO CBD Z` and `Bank:KZO CBD Z`). The check therefore compares the **resolved account Ids**, and runs at
 both stages:
 
 - **Transform** (`process_transfers` -> `validate_transfer_row`) writes the remark into the
   sheet, so the row is visible as broken before any sync runs:
 
   ```
-  ERROR | 'From' and 'To' resolve to the same QBO account (Id 77): 'CBD Z Card' -> 'KZO CBD Z' | Row No: 12
+  ERROR | 'From' and 'To' resolve to the same QBO account (Id 77): 'KZO CBD Z' -> 'Bank:KZO CBD Z' | Row No: 12
   ```
 
 - **Sync** (`QBOSync.push_transfer`) repeats it, because a row can be marked `Ready to sync`
@@ -575,7 +639,7 @@ both stages:
 
   ```
   ERROR: Transfer From and To resolve to the same QBO account (Id 77):
-  'CBD Z Card' -> 'KZO CBD Z'. Money cannot move within one account; fix the From/To columns.
+  'KZO CBD Z' -> 'Bank:KZO CBD Z'. Money cannot move within one account; fix the From/To columns.
   ```
 
 The plain same-text check stays ahead of both and keeps its own shorter message.

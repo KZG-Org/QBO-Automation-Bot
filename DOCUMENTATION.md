@@ -337,7 +337,7 @@ Use for one-off cleanup; ensure IDs and entity type are correct.
 |-------|----------------|
 | **Token / auth errors** | `config/secrets.env` present; QBO_CLIENT_ID/SECRET correct; Master Sheet has valid Refresh Token for that Realm ID; token.json exists and is valid for Sheets. |
 | **"Realm ID not found"** | Master Sheet has a row with that Realm ID and column name matches `MST_COL_REALM_ID`. |
-| **"Account not found" / mapping errors** | QBO company has the accounts/locations/classes/vendors; names match (exact, leaf, or fuzzy). Check transformer/syncing hardcoded replacements (e.g. "CBD Z Card" → "KZO CBD Z"). |
+| **"Account not found" / mapping errors** | Accounts: exact or suffix-path name, or a row in the client's Account Map tab (README "Account Map tab"); never fuzzy. Locations/classes/vendors: exact, leaf or fuzzy. Add a Manual row to the Account Map tab for a renamed or differently written account. |
 | **Unbalanced journal** | Transformer auto-adjusts small rounding (≤0.50); if larger, fix source data or rules in `process_journals`. |
 | **Sync 401/403** | Refresh token expired or revoked; re-authorize app and update Refresh Token in Master Sheet. |
 | **Sheets quota / 429** | GSheets client uses retry with backoff; reduce frequency of runs or batch size. |
