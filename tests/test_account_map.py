@@ -5,8 +5,10 @@ import gspread
 import pandas as pd
 
 import run_ingestion
+import run_syncing
 from src.connectors.gsheets_client import GSheetsClient
 from src.logic import month_end
+from src.logic.syncing import QBOSync
 from src.logic.transformer import process_expenses, process_transfers
 from src.logic.account_map import (
     ACCOUNT_MAP_HEADERS,
@@ -411,6 +413,64 @@ class IngestionAccountMapTests(unittest.TestCase):
         _, write, ctrl = self._run(boom)
         ctrl.assert_not_called()
         write.assert_not_called()
+
+
+def _sync_engine(accounts, rows=None):
+    client = MagicMock()
+    client.client_name = "KZO"
+    client.realm_id = "R1"
+    with patch.object(QBOSync, "_get_qbo_mappings", return_value={}):
+        sync = QBOSync(client)
+    sync.mappings = {"accounts": accounts, "accounts_meta": {}}
+    if rows is not None:
+        sync.use_account_map(rows)
+    return sync
+
+
+class SyncIntegrationTests(unittest.TestCase):
+    def test_sync_resolves_a_renamed_account_through_the_map(self):
+        # Renamed in QBO after Transform: Transform saved the Auto row, Sync uses it.
+        sync = _sync_engine(RENAMED_ACCOUNTS, [RENAMED_ROW])
+        self.assertEqual(sync.find_id("accounts", "Leading Card ACCT - 3214"), "28")
+
+    def test_cbd_z_card_is_no_longer_rewritten_at_sync(self):
+        sync = _sync_engine({"Bank:KZO CBD Z": "900"}, [])
+        self.assertIsNone(sync.find_id("accounts", "CBD Z Card"))
+
+    def test_replacing_mappings_rebuilds_the_resolver(self):
+        sync = _sync_engine({"Bank:A": "1"}, [])
+        self.assertEqual(sync.find_id("accounts", "A"), "1")
+        sync.mappings = {"accounts": {"Bank:B": "2"}, "accounts_meta": {}}
+        self.assertIsNone(sync.find_id("accounts", "A"))
+        self.assertEqual(sync.find_id("accounts", "B"), "2")
+
+    def _run_sync(self, read_map):
+        gs = MagicMock()
+        gs.read_as_df.return_value = pd.DataFrame([{"Country": "TH", "QBO Sync": "SYNC NOW",
+                                                    "Transform File": "url", "Month": "2026-11-01"}])
+        engine = MagicMock()
+        with patch.object(run_syncing, "QBOSync", return_value=engine), \
+             patch.object(run_syncing, "read_account_map", side_effect=read_map), \
+             patch("src.logic.account_map.write_account_map_changes") as write, \
+             patch.object(run_syncing, "_batch_update_control", side_effect=RuntimeError("stop")) as ctrl:
+            try:
+                run_syncing.process_client_sync(gs, MagicMock(), "ctrl", "KZO", "R1")
+            except RuntimeError:
+                pass
+        return engine, write, ctrl
+
+    def test_sync_loads_the_map_and_never_writes_it(self):
+        rows = [RENAMED_ROW]
+        engine, write, ctrl = self._run_sync(lambda gs, sid: rows)
+        engine.use_account_map.assert_called_once_with(rows)
+        ctrl.assert_called()  # reached the control rows
+        write.assert_not_called()
+
+    def test_sync_stops_when_the_map_cannot_be_read(self):
+        def boom(gs, sid):
+            raise RuntimeError("429 quota")
+        _, _, ctrl = self._run_sync(boom)
+        ctrl.assert_not_called()
 
 
 if __name__ == "__main__":

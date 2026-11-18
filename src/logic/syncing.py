@@ -6,7 +6,7 @@ from datetime import datetime
 from config import settings
 from src.utils.logger import setup_logger
 from src.connectors.qbo_client import QBOClient
-from src.logic.account_aliases import resolve_account_alias
+from src.logic.account_map import AccountResolver, MapRow
 
 from dotenv import load_dotenv
 load_dotenv("config/secrets.env")
@@ -97,6 +97,29 @@ class QBOSync:
     def __init__(self, client: QBOClient):
         self.client = client
         self.mappings = self._get_qbo_mappings()
+        self._account_map_rows: list[MapRow] = []
+        self._resolver: AccountResolver | None = None
+        self._resolver_accounts = None
+
+    def use_account_map(self, rows: list[MapRow]) -> None:
+        """Resolve accounts with this client's Account Map rows (read-only here)."""
+        self._account_map_rows = list(rows or [])
+        self._resolver = None
+
+    def _account_resolver(self) -> AccountResolver:
+        # Rebuilt when self.mappings["accounts"] is replaced (tests swap mappings after init).
+        accounts = self.mappings.get("accounts", {})
+        if getattr(self, "_resolver", None) is None or self._resolver_accounts is not accounts:
+            client_name = getattr(self.client, "client_name", "")
+            realm_id = getattr(self.client, "realm_id", "")
+            self._resolver = AccountResolver(
+                accounts,
+                client_name if isinstance(client_name, str) else "",
+                realm_id if isinstance(realm_id, str) else "",
+                getattr(self, "_account_map_rows", []),
+            )
+            self._resolver_accounts = accounts
+        return self._resolver
 
     def build_qbo_url(self, entity: str, txn_id: str) -> str:
         """
@@ -181,31 +204,19 @@ class QBOSync:
     def find_id(self, mapping_key: str, search_name: str, warn_on_missing: bool = True) -> str | None:
         if not search_name or pd.isna(search_name) or str(search_name).strip() == "": return None
         
-        mapping_dict = self.mappings.get(mapping_key, {})
         if mapping_key == "accounts":
-            # Normalizes ':' spacing and applies the workspace's alias table (KZP's
-            # duplicated 'Growth' leaf) -- same rewrite the transform stage did, so a row
-            # marked 'Ready to sync' resolves to the same account here.
-            clean_name = resolve_account_alias(search_name, getattr(self.client, "client_name", ""))
-        else:
-            clean_name = re.sub(r'\s+', ' ', str(search_name)).strip()
-        
-        # 2. Explicit Replacements (Hardcoded fixes)
-        replacements = {
-            "CBD Z Card":   "KZO CBD Z",
-        }
+            # Same resolver as the transform stage (src/logic/account_map.py), so a row marked
+            # 'Ready to sync' resolves to the same account here -- Account Map tab included.
+            res = self._account_resolver().resolve(search_name)
+            if res.account_id is None:
+                if warn_on_missing:
+                    logger.warning(f"      ❌ [Sync Map] FAILED: '{search_name}'. {res.detail}")
+            elif res.how != "exact":
+                logger.info(f"      ✅ [Sync Map] {res.how.upper()}: '{search_name}' -> '{res.qbo_name}'")
+            return res.account_id
 
-        for bad_text, target_text in replacements.items():
-            # Check if the bad text exists (Case Insensitive)
-            if bad_text.lower() in clean_name.lower():
-                # regex sub: Replace ONLY the bad_text part with target_text
-                # flags=re.IGNORECASE ensures "cbd z card" matches "CBD Z Card"
-                clean_name = re.sub(re.escape(bad_text), target_text, clean_name, flags=re.IGNORECASE)
-                
-                # Update the search variable for the next steps
-                search_lower = clean_name.lower()
-                break
-
+        mapping_dict = self.mappings.get(mapping_key, {})
+        clean_name = re.sub(r'\s+', ' ', str(search_name)).strip()
         search_lower = clean_name.lower()
 
         # 1. EXACT MATCH
@@ -234,27 +245,16 @@ class QBOSync:
             logger.info(f"      ✅ [Sync Map] LEAF: '{search_name}' -> '{name}'")
             return qbo_id
         if len(suffix_hits) > 1:
-            # Same name under two parents -- guessing is the same class of error as a fuzzy
-            # sibling match, so accounts refuse rather than pick one.
-            if mapping_key == "accounts":
-                logger.error(
-                    f"      ❌ [Sync Map] AMBIGUOUS: '{search_name}' matches {sorted(suffix_hits.values())}"
-                )
-                return None
             return next(iter(suffix_hits))
 
-        # 3. FUZZY MATCH (80%) -- NOT for accounts.
-        # Accounts are money destinations, and real charts of accounts contain siblings that
-        # differ only by a short code: "Investment in HR Company (ORZ)" vs "(OSR)" scores 0.82
-        # against the fully-qualified names, so fuzzy would silently post to the wrong
-        # account. Accounts must match exactly or by leaf name; anything else fails loudly and
-        # is surfaced as an ERROR remark / raised ValueError for a human to fix in the sheet.
-        if mapping_key != "accounts":
-            matches = difflib.get_close_matches(clean_name, list(mapping_dict.keys()), n=1, cutoff=0.80)
-            if matches:
-                best = matches[0]
-                logger.info(f"      ✨ [Sync Map] FUZZY (80%): '{search_name}' -> '{best}'")
-                return mapping_dict[best]
+        # 3. FUZZY MATCH (80%) -- locations, classes, vendors, payment methods only.
+        # Accounts returned above and never get here: real charts of accounts hold siblings
+        # that differ only by a short code ("Investment in HR Company (ORZ)" vs "(OSR)").
+        matches = difflib.get_close_matches(clean_name, list(mapping_dict.keys()), n=1, cutoff=0.80)
+        if matches:
+            best = matches[0]
+            logger.info(f"      ✨ [Sync Map] FUZZY (80%): '{search_name}' -> '{best}'")
+            return mapping_dict[best]
 
         if warn_on_missing:
             near = difflib.get_close_matches(clean_name, list(mapping_dict.keys()), n=3, cutoff=0.60)

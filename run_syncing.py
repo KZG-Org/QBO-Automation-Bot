@@ -23,6 +23,7 @@ from config import settings
 from src.connectors.gsheets_client import GSheetsClient
 from src.connectors.qbo_client import QBOClient
 from src.logic.syncing import QBOSync
+from src.logic.account_map import read_account_map
 from src.logic.month_end import (
     CLASH_REMARK,
     find_number_clashes,
@@ -295,6 +296,14 @@ def process_client_sync(
         return
 
     sync_engine = QBOSync(client=qbo_client)
+
+    # Account Map tab (README "Account Map tab"): read-only here, only Transform writes it.
+    # A run never goes ahead without it, since a Manual row may keep a row off the wrong account.
+    try:
+        sync_engine.use_account_map(read_account_map(gs, control_sheet_id))
+    except Exception as e:
+        logger.error(f"❌ [{client_name}] Cannot read the Account Map tab: {e}")
+        return
 
     COL_QBO_JV = "QBO Journal"
     COL_QBO_EXP = "QBO Expense"
