@@ -255,6 +255,27 @@ class GSheetsClient:
             batch_payload.append({'range': a1_notation, 'values': [[str(u['val'])]]})
         ws.batch_update(batch_payload, value_input_option="USER_ENTERED")
 
+    @retry_with_backoff()
+    def write_values_raw(self, spreadsheet_url_or_id: str, tab_name: str,
+                         updates: list[tuple[str, list[list[str]]]],
+                         create_if_missing: bool = False) -> None:
+        """Write [(A1 range, rows)] in one batch call, values stored exactly as given (RAW).
+
+        RAW keeps typed text as text: an account name starting with '=' or an Id like '210'
+        is not turned into a formula or a number.
+        """
+        if not updates:
+            return
+        sh = self.open(spreadsheet_url_or_id)
+        try:
+            ws = sh.worksheet(tab_name)
+        except gspread.exceptions.WorksheetNotFound:
+            if not create_if_missing:
+                raise
+            ws = sh.add_worksheet(title=tab_name, rows=1000, cols=10)
+        ws.batch_update([{"range": a1, "values": vals} for a1, vals in updates],
+                        value_input_option="RAW")
+
     def delete_rows(self, spreadsheet_url_or_id: str, tab_name: str, row_indices: list[int]):
         """Delete sheet rows (1-based) of one tab in one batchUpdate, or raise."""
         self.delete_rows_by_tab(spreadsheet_url_or_id, {tab_name: row_indices})

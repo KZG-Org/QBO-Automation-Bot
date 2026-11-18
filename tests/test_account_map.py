@@ -1,10 +1,19 @@
 import unittest
+from unittest.mock import MagicMock
 
+import gspread
+
+from src.connectors.gsheets_client import GSheetsClient
 from src.logic.account_map import (
+    ACCOUNT_MAP_HEADERS,
+    ACCOUNT_MAP_TAB,
     AccountResolver,
     MapRow,
     normalize_qbo_id,
+    parse_account_map,
+    read_account_map,
     resolve_account,
+    write_account_map_changes,
 )
 
 ACCOUNTS = {
@@ -168,6 +177,144 @@ class AccountResolverTests(unittest.TestCase):
             (row.sheet_name, row.type, row.qbo_id, row.qbo_account),
             ("S5A", "Auto", "210", "Cash On Hand:CBD Z 1"),
         )
+
+
+HEADER = list(ACCOUNT_MAP_HEADERS)
+
+
+class _FakeGs:
+    """Stands in for GSheetsClient: serves the Account Map grid and records writes."""
+
+    def __init__(self, grid):
+        self.grid = grid
+        self.reads = 0
+        self.writes = []
+
+    def read_tab_values(self, sheet_id, tab):
+        assert tab == ACCOUNT_MAP_TAB
+        self.reads += 1
+        if isinstance(self.grid, Exception):
+            raise self.grid
+        return self.grid
+
+    def write_values_raw(self, sheet_id, tab, updates, create_if_missing=False):
+        self.writes.append({"tab": tab, "updates": updates, "create": create_if_missing})
+
+
+def _ranges(call):
+    return [a1 for a1, _ in call["updates"]]
+
+
+def _auto(name, acc_id="28", row_num=None):
+    return MapRow(name, f"Q:{name}", acc_id, "Auto", "R1", "2026-11-18 10:00", row_num)
+
+
+class AccountMapTabTests(unittest.TestCase):
+    def test_parse_reads_columns_by_header_name(self):
+        rows = parse_account_map([
+            ["Note", "QBO ID", "Sheet Name", "Type", "QBO Account", "Realm ID", "Updated At"],
+            ["hi", "28", "Leading Card ACCT - 3214", "Auto", "x", "R1", ""],
+        ])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0].sheet_name, rows[0].qbo_id, rows[0].row_num), ("Leading Card ACCT - 3214", "28", 2))
+        self.assertFalse(rows[0].is_manual)
+
+    def test_parse_skips_blank_sheet_names(self):
+        rows = parse_account_map([HEADER, ["", "x", "1", "Auto", "R1", ""], ["A", "x", "1", "Auto", "R1", ""]])
+        self.assertEqual([r.sheet_name for r in rows], ["A"])
+        self.assertEqual(rows[0].row_num, 3)
+
+    def test_missing_tab_reads_as_empty(self):
+        self.assertEqual(read_account_map(_FakeGs(None), "sid"), [])
+
+    def test_read_error_propagates(self):
+        with self.assertRaises(RuntimeError):
+            read_account_map(_FakeGs(RuntimeError("429 quota")), "sid")
+
+    def test_no_changes_means_no_read_and_no_write(self):
+        gs = _FakeGs([HEADER])
+        self.assertEqual(write_account_map_changes(gs, "sid", []), 0)
+        self.assertEqual((gs.reads, gs.writes), (0, []))
+
+    def test_new_rows_go_below_the_last_row_in_one_call(self):
+        gs = _FakeGs([HEADER, ["A", "", "", "", "", ""], ["B", "", "", "", "", ""], ["C", "", "", "", "", ""]])
+        n = write_account_map_changes(gs, "sid", [_auto("D"), _auto("E")])
+        self.assertEqual(n, 2)
+        self.assertEqual(len(gs.writes), 1)
+        ranges = _ranges(gs.writes[0])
+        self.assertIn("A5", ranges)
+        self.assertIn("F6", ranges)
+        self.assertNotIn("A4", ranges)
+
+    def test_rows_are_matched_by_name_after_a_sort(self):
+        gs = _FakeGs([HEADER, ["B", "x", "1", "Auto", "R1", ""], ["A", "x", "1", "Auto", "R1", ""]])
+        write_account_map_changes(gs, "sid", [_auto("B", row_num=3)])
+        ranges = _ranges(gs.writes[0])
+        self.assertIn("C2", ranges)
+        self.assertNotIn("C3", ranges)
+
+    def test_manual_change_writes_only_id_realm_and_date(self):
+        gs = _FakeGs([HEADER, ["Foo", "Typed name", "", "Manual", "", ""]])
+        change = MapRow("Foo", "Typed name", "28", "Manual", "R1", "2026-11-18 10:00", 2)
+        write_account_map_changes(gs, "sid", [change])
+        self.assertEqual(sorted(_ranges(gs.writes[0])), ["C2", "E2", "F2"])
+
+    def test_auto_change_skips_a_row_the_team_made_manual(self):
+        gs = _FakeGs([HEADER, ["Foo", "Typed name", "", "Manual", "", ""]])
+        self.assertEqual(write_account_map_changes(gs, "sid", [_auto("Foo", row_num=2)]), 0)
+        self.assertEqual(gs.writes, [])
+
+    def test_missing_tab_is_created_with_headers(self):
+        gs = _FakeGs(None)
+        write_account_map_changes(gs, "sid", [_auto("A")])
+        call = gs.writes[0]
+        self.assertTrue(call["create"])
+        self.assertEqual(call["updates"][0], ("A1", [HEADER]))
+        self.assertIn("A2", _ranges(call))
+
+    def test_missing_header_columns_are_added_to_the_right(self):
+        gs = _FakeGs([["Sheet Name", "QBO Account", "QBO ID", "Type"], ["A", "x", "1", "Auto"]])
+        write_account_map_changes(gs, "sid", [_auto("A", row_num=2)])
+        updates = dict(gs.writes[0]["updates"])
+        self.assertEqual(updates["E1"], [["Realm ID", "Updated At"]])
+        self.assertEqual(updates["E2"], [["R1"]])
+
+
+class WriteValuesRawTests(unittest.TestCase):
+    def _gs(self, tab_exists=True):
+        gs = GSheetsClient.__new__(GSheetsClient)  # skip OAuth
+        sh = MagicMock()
+        ws = MagicMock()
+        if tab_exists:
+            sh.worksheet.return_value = ws
+        else:
+            sh.worksheet.side_effect = gspread.exceptions.WorksheetNotFound("x")
+            sh.add_worksheet.return_value = ws
+        gs.open = MagicMock(return_value=sh)
+        return gs, sh, ws
+
+    def test_writes_every_range_raw_in_one_call(self):
+        gs, _, ws = self._gs()
+        gs.write_values_raw("sid", ACCOUNT_MAP_TAB, [("A2", [["=x"]]), ("C2", [["28"]])])
+        ws.batch_update.assert_called_once_with(
+            [{"range": "A2", "values": [["=x"]]}, {"range": "C2", "values": [["28"]]}],
+            value_input_option="RAW",
+        )
+
+    def test_creates_the_tab_only_when_asked(self):
+        gs, sh, ws = self._gs(tab_exists=False)
+        gs.write_values_raw("sid", ACCOUNT_MAP_TAB, [("A1", [HEADER])], create_if_missing=True)
+        sh.add_worksheet.assert_called_once()
+        ws.batch_update.assert_called_once()
+
+        gs2, _, _ = self._gs(tab_exists=False)
+        with self.assertRaises(gspread.exceptions.WorksheetNotFound):
+            gs2.write_values_raw("sid", ACCOUNT_MAP_TAB, [("A1", [HEADER])])
+
+    def test_no_updates_makes_no_call(self):
+        gs, sh, _ = self._gs()
+        gs.write_values_raw("sid", ACCOUNT_MAP_TAB, [])
+        gs.open.assert_not_called()
 
 
 if __name__ == "__main__":

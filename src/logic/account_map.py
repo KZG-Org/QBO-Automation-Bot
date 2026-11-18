@@ -286,6 +286,129 @@ class AccountResolver:
         )
 
 
+# ------------------------------------------------------------------ the tab itself
+def _header_index(header_row) -> dict[str, int]:
+    """{lowercased header: 0-based column} for the non-blank header cells."""
+    return {str(h).strip().lower(): i for i, h in enumerate(header_row) if str(h).strip()}
+
+
+def _cell(row, idx) -> str:
+    if idx is None or idx >= len(row):
+        return ""
+    value = row[idx]
+    return "" if value is None else str(value).strip()
+
+
+def parse_account_map(values: list[list]) -> list[MapRow]:
+    """Rows of the tab, columns found by header name (the team may reorder or add columns)."""
+    if not values:
+        return []
+    cols = _header_index(values[0])
+    if "sheet name" not in cols:
+        logger.warning("[Account Map] the tab has no 'Sheet Name' header; ignoring it")
+        return []
+    get = {h: cols.get(h.lower()) for h in ACCOUNT_MAP_HEADERS}
+    rows = []
+    for row_num, row in enumerate(values[1:], start=2):
+        name = _cell(row, get["Sheet Name"])
+        if not name:
+            continue
+        rows.append(MapRow(
+            sheet_name=name,
+            qbo_account=_cell(row, get["QBO Account"]),
+            qbo_id=_cell(row, get["QBO ID"]),
+            type=_cell(row, get["Type"]),
+            realm_id=_cell(row, get["Realm ID"]),
+            updated_at=_cell(row, get["Updated At"]),
+            row_num=row_num,
+        ))
+    return rows
+
+
+def read_account_map(gs, spreadsheet_id: str) -> list[MapRow]:
+    """The client's map. A missing tab is empty; any other read error is raised."""
+    values = gs.read_tab_values(spreadsheet_id, ACCOUNT_MAP_TAB)
+    if values is None:
+        return []
+    return parse_account_map(values)
+
+
+def _row_values(row: MapRow) -> dict[str, str]:
+    return {
+        "Sheet Name": row.sheet_name,
+        "QBO Account": row.qbo_account,
+        "QBO ID": normalize_qbo_id(row.qbo_id),
+        "Type": AUTO if not row.is_manual else (row.type or ""),
+        "Realm ID": row.realm_id,
+        "Updated At": row.updated_at,
+    }
+
+
+def write_account_map_changes(gs, spreadsheet_id: str, changes: list[MapRow]) -> int:
+    """Write new and changed rows in one call. Returns the number of rows written.
+
+    The tab is read again first and rows are matched by Sheet Name, so a sort or insert by the
+    team since the run's first read cannot send an update to the wrong row. A Manual row only
+    ever gets its QBO ID, Realm ID and Updated At cells written.
+    """
+    if not changes:
+        return 0
+    from gspread.utils import rowcol_to_a1
+
+    values = gs.read_tab_values(spreadsheet_id, ACCOUNT_MAP_TAB)
+    create = values is None
+    updates: list[tuple[str, list[list[str]]]] = []
+
+    if not values:
+        cols = {h.lower(): i for i, h in enumerate(ACCOUNT_MAP_HEADERS)}
+        updates.append(("A1", [list(ACCOUNT_MAP_HEADERS)]))
+        last_row = 1
+        existing: dict[str, tuple[int, bool]] = {}
+    else:
+        cols = _header_index(values[0])
+        missing = [h for h in ACCOUNT_MAP_HEADERS if h.lower() not in cols]
+        if missing:
+            start = max(cols.values(), default=-1) + 1
+            for offset, h in enumerate(missing):
+                cols[h.lower()] = start + offset
+            updates.append((rowcol_to_a1(1, start + 1), [missing]))
+        last_row = max(
+            (i for i, row in enumerate(values, start=1) if any(str(c).strip() for c in row)),
+            default=1,
+        )
+        existing = {map_key(r.sheet_name): (r.row_num, r.is_manual) for r in parse_account_map(values)}
+
+    def put(row_num: int, header: str, value: str) -> None:
+        updates.append((rowcol_to_a1(row_num, cols[header.lower()] + 1), [[str(value or "")]]))
+
+    written = 0
+    for change in changes:
+        key = map_key(change.sheet_name)
+        cells = _row_values(change)
+        if key in existing:
+            row_num, sheet_is_manual = existing[key]
+            if change.is_manual:
+                for h in ("QBO ID", "Realm ID", "Updated At"):
+                    put(row_num, h, cells[h])
+            elif sheet_is_manual:
+                continue  # the team took this row over since the first read
+            else:
+                for h in ACCOUNT_MAP_HEADERS:
+                    put(row_num, h, cells[h])
+        else:
+            if change.is_manual:
+                continue  # the team deleted the row since the first read
+            last_row += 1
+            existing[key] = (last_row, False)
+            for h in ACCOUNT_MAP_HEADERS:
+                put(last_row, h, cells[h])
+        written += 1
+
+    if written:
+        gs.write_values_raw(spreadsheet_id, ACCOUNT_MAP_TAB, updates, create_if_missing=create)
+    return written
+
+
 def resolve_account(qbo_mappings: dict | None, name, client_name: str = "") -> Resolution:
     """Resolve through the run's resolver; build a map-less one when the run has none."""
     if qbo_mappings is None:
