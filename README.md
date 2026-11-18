@@ -449,6 +449,15 @@ match**, plus the hardcoded `replacements` table for known aliases. There is **n
 fallback for accounts** — if none match, the row fails with
 `ERROR | Account not found: '<name>'` in `Remarks` and is never synced.
 
+The `replacements` table holds one rule: `CBD Z Card` -> `KZO CBD Z`. It is the same in
+`transformer.py`, `syncing.py` and `reconciler.py`. A rule rewrites the sheet name **before**
+the lookup, so when someone renames the account in QBO, the rule must be removed or changed
+the same day, or every row with that name fails `Account not found`.
+
+Removed on 2026-11-18: `Leading Card MKT - 1238` -> `Leading Card - 1238`. QBO renamed
+account 11191 to `Leading Card MKT - 1238`, so the rule sent every row to a name QBO no
+longer had. The sheet name now matches QBO directly.
+
 Suffix-path matching compares the sheet value against *every trailing path* of the QBO
 fully-qualified name, so a sheet value may drop any number of leading parent levels:
 

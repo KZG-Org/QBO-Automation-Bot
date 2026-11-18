@@ -70,12 +70,9 @@ class AccountMatchingTests(unittest.TestCase):
         self.assertEqual(acc_id, "1150040132")
 
     def test_hardcoded_replacements_still_apply_without_fuzzy(self):
-        mapping = {"Bank:KZO CBD Z": "900", "Bank:Leading Card - 1238": "901"}
+        mapping = {"Bank:KZO CBD Z": "900"}
 
         self.assertEqual(find_id_in_map(mapping, "CBD Z Card", allow_fuzzy=False), "900")
-        self.assertEqual(
-            find_id_in_map(mapping, "Leading Card MKT - 1238", allow_fuzzy=False), "901"
-        )
 
     def test_fuzzy_still_available_for_non_account_maps(self):
         # Vendors/classes/locations keep fuzzy -- names there genuinely vary and a wrong
@@ -245,6 +242,43 @@ class KzpGrowthAliasReconcileTests(unittest.TestCase):
         self.assertTrue(rec._is_account_match("Equipment", "Fixed Assets:Equipment"))
         self.assertTrue(rec._is_account_match("Fixed Assets:Equipment", "Fixed Assets:Equipment"))
         self.assertTrue(rec._is_account_match("Affiliate", "Marketing Income:Affiliates"))
+
+
+class LeadingCardRenameTests(unittest.TestCase):
+    """QBO renamed 'Leading Card - 1238' to 'Leading Card MKT - 1238' (account 11191).
+
+    The old hardcoded rewrite 'Leading Card MKT - 1238' -> 'Leading Card - 1238' then sent every
+    sheet row to a name QBO no longer has, so the row failed 'Account not found' at all three
+    stages. The sheet name must resolve to the account as QBO names it now.
+    """
+
+    QBO_ACCOUNTS = {"Employee Cash Advances:Leading Card MKT - 1238": "11191"}
+
+    def test_transform_resolves_the_mkt_name(self):
+        self.assertEqual(
+            find_id_in_map(self.QBO_ACCOUNTS, "Leading Card MKT - 1238", allow_fuzzy=False),
+            "11191",
+        )
+
+    def test_sync_resolves_the_mkt_name(self):
+        client = MagicMock()
+        client.client_name = "KZO"
+        with patch.object(QBOSync, "_get_qbo_mappings", return_value={}):
+            sync = QBOSync(client)
+        sync.mappings = {"accounts": self.QBO_ACCOUNTS, "accounts_meta": {}}
+
+        self.assertEqual(sync.find_id("accounts", "Leading Card MKT - 1238"), "11191")
+
+    def test_reconcile_matches_the_mkt_name(self):
+        client = MagicMock()
+        client.client_name = "KZO"
+        rec = Reconciler(client)
+
+        self.assertTrue(
+            rec._is_account_match(
+                "Leading Card MKT - 1238", "Employee Cash Advances:Leading Card MKT - 1238"
+            )
+        )
 
 
 if __name__ == "__main__":

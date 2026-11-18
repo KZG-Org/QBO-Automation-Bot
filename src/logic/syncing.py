@@ -193,7 +193,6 @@ class QBOSync:
         # 2. Explicit Replacements (Hardcoded fixes)
         replacements = {
             "CBD Z Card":   "KZO CBD Z",
-            "Leading Card MKT - 1238": "Leading Card - 1238"
         }
 
         for bad_text, target_text in replacements.items():
