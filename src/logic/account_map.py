@@ -409,6 +409,17 @@ def write_account_map_changes(gs, spreadsheet_id: str, changes: list[MapRow]) ->
     return written
 
 
+def fetch_qbo_accounts(qbo_client) -> dict[str, str]:
+    """Active QBO accounts as {full name: Id}, the same keys QBOSync's mappings use."""
+    accounts: dict[str, str] = {}
+    for item in qbo_client.query("SELECT Id, Name, FullyQualifiedName FROM Account"):
+        name = item.get("FullyQualifiedName") or item.get("Name")
+        acc_id = normalize_qbo_id(item.get("Id"))
+        if name and acc_id:
+            accounts[str(name)] = acc_id
+    return accounts
+
+
 def resolve_account(qbo_mappings: dict | None, name, client_name: str = "") -> Resolution:
     """Resolve through the run's resolver; build a map-less one when the run has none."""
     if qbo_mappings is None:

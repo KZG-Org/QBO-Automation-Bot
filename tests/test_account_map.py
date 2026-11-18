@@ -5,6 +5,7 @@ import gspread
 import pandas as pd
 
 import run_ingestion
+import run_reconciliation
 import run_syncing
 from src.connectors.gsheets_client import GSheetsClient
 from src.logic import month_end
@@ -15,6 +16,7 @@ from src.logic.account_map import (
     ACCOUNT_MAP_TAB,
     AccountResolver,
     MapRow,
+    fetch_qbo_accounts,
     normalize_qbo_id,
     parse_account_map,
     read_account_map,
@@ -470,6 +472,50 @@ class SyncIntegrationTests(unittest.TestCase):
         def boom(gs, sid):
             raise RuntimeError("429 quota")
         _, _, ctrl = self._run_sync(boom)
+        ctrl.assert_not_called()
+
+
+class ReconcileAccountMapTests(unittest.TestCase):
+    def test_fetch_qbo_accounts_keys_by_full_name(self):
+        client = MagicMock()
+        client.query.return_value = [
+            {"Id": 28, "Name": "Leading Card ACC - 3214",
+             "FullyQualifiedName": "Leading Card:Leading Card ACCT:Leading Card ACC - 3214"},
+            {"Id": "88", "Name": "KZO Bank TH"},
+        ]
+        self.assertEqual(
+            fetch_qbo_accounts(client),
+            {"Leading Card:Leading Card ACCT:Leading Card ACC - 3214": "28", "KZO Bank TH": "88"},
+        )
+        self.assertIn("FROM Account", client.query.call_args[0][0])
+
+    def _run_reconcile(self, read_map):
+        gs = MagicMock()
+        gs.read_as_df.return_value = pd.DataFrame([{"Country": "TH", "QBO Reconcile": "RECONCILE NOW",
+                                                    "Transform File": "url", "Month": "2026-11-01"}])
+        with patch.object(run_reconciliation, "read_account_map", side_effect=read_map), \
+             patch.object(run_reconciliation, "fetch_qbo_accounts", return_value={"Bank:A": "1"}), \
+             patch.object(run_reconciliation, "Reconciler") as rec_cls, \
+             patch.object(run_reconciliation, "_batch_update_control", side_effect=RuntimeError("stop")) as ctrl:
+            try:
+                run_reconciliation.process_client_reconcile(gs, MagicMock(), "ctrl", "KZO", "R1")
+            except RuntimeError:
+                pass
+        return rec_cls, ctrl
+
+    def test_reconcile_gets_a_resolver_with_the_map(self):
+        rec_cls, ctrl = self._run_reconcile(lambda gs, sid: [RENAMED_ROW])
+        resolver = rec_cls.call_args.kwargs["account_resolver"]
+        self.assertIsInstance(resolver, AccountResolver)
+        self.assertEqual(resolver.account_id("Leading Card ACCT - 3214"), None)  # 28 not in {"Bank:A"}
+        self.assertEqual(resolver.account_id("A"), "1")
+        ctrl.assert_called()
+
+    def test_reconcile_stops_when_the_map_cannot_be_read(self):
+        def boom(gs, sid):
+            raise RuntimeError("429 quota")
+        rec_cls, ctrl = self._run_reconcile(boom)
+        rec_cls.assert_not_called()
         ctrl.assert_not_called()
 
 

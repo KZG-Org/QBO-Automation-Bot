@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 
 import pandas as pd
 
+from src.logic.account_map import AccountResolver, MapRow
 from src.logic.reconciler import Reconciler
 
 
@@ -176,20 +177,57 @@ class RawVsTransformEstNoTests(unittest.TestCase):
 class JournalLineMatchingTests(unittest.TestCase):
     """reconcile_journals pairs each sheet line with one QBO line of the same journal."""
 
-    @staticmethod
-    def _line(posting, amount, account, description=""):
-        return {"Amount": amount, "DetailType": "JournalEntryLineDetail", "Description": description,
-                "JournalEntryLineDetail": {"PostingType": posting, "AccountRef": {"name": account}}}
+    # The KZDW chart of accounts these tests post against (full name -> QBO Id).
+    ACCOUNTS = {
+        "Cash on Hand:KZDW DPP TH 2": "1", "Miscellaneous:Payment/Banking": "2",
+        "Amount Owing (by)/to KZO": "3", "Cash on Hand:KZDW FIN OPS TRC 1": "4",
+        "DPP:System Fees Rebate from HengSlip": "5", "Payment:Exchange Gain": "6",
+        "Payment:Exchange Loss": "7", "Payment:Bank Charges": "8",
+        "Cash:KZO COY TRC 4 - Reserve Fund": "9", "Cash:KZO COY TRC 4A - Reserve Fund": "10",
+        "Exp:Fee": "11", "Cards:New Card": "28",
+    }
 
-    def _run(self, sheet_lines, qbo_lines):
+    @classmethod
+    def _line(cls, posting, amount, account, description=""):
+        return {"Amount": amount, "DetailType": "JournalEntryLineDetail", "Description": description,
+                "JournalEntryLineDetail": {"PostingType": posting,
+                                           "AccountRef": {"name": account, "value": cls.ACCOUNTS[account]}}}
+
+    def _run(self, sheet_lines, qbo_lines, rows=()):
         client = MagicMock()
         client.client_name = "KZDW"
         client.query.return_value = [{"Id": "11999", "DocNumber": "KZDW-JV0666", "TxnDate": "2026-09-11", "Line": qbo_lines}]
         df = pd.DataFrame([{"Journal No": "KZDW-JV0666", "Date": "9/11/2026", "Account": line[0], "Amount": line[1],
                             "Memo": line[2] if len(line) > 2 else "", "QBO ID": "11999"}
                            for line in sheet_lines])
-        updates = Reconciler(client).reconcile_journals(df, "2026-09-01")
+        resolver = AccountResolver(self.ACCOUNTS, "KZDW", "R1", list(rows))
+        updates = Reconciler(client, account_resolver=resolver).reconcile_journals(df, "2026-09-01")
         return [u["status"] for u in sorted(updates, key=lambda u: u["row_idx"])]
+
+    def test_sibling_account_is_a_mismatch(self):
+        # Fuzzy name matching scored these two Reserve Funds 0.98 alike and called it a match.
+        statuses = self._run(
+            [("KZO COY TRC 4 - Reserve Fund", -100.0), ("Fee", 100.0)],
+            [self._line("Credit", 100.0, "Cash:KZO COY TRC 4A - Reserve Fund"),
+             self._line("Debit", 100.0, "Exp:Fee")],
+        )
+        self.assertTrue(statuses[0].startswith("❌ Account Mismatch"), statuses[0])
+        self.assertEqual(statuses[1], "✅ Matched")
+
+    def test_renamed_account_matches_by_id(self):
+        statuses = self._run(
+            [("Old Card", -50.0), ("Fee", 50.0)],
+            [self._line("Credit", 50.0, "Cards:New Card"), self._line("Debit", 50.0, "Exp:Fee")],
+            rows=[MapRow("Old Card", "x", "28", "Auto", "R1")],
+        )
+        self.assertEqual(statuses, ["✅ Matched", "✅ Matched"])
+
+    def test_unknown_sheet_account_is_reported(self):
+        statuses = self._run(
+            [("Nope", -50.0), ("Fee", 50.0)],
+            [self._line("Credit", 50.0, "Cards:New Card"), self._line("Debit", 50.0, "Exp:Fee")],
+        )
+        self.assertEqual(statuses[0], "❌ Account not found: 'Nope'")
 
     def test_fallback_of_an_earlier_row_does_not_steal_a_later_exact_match(self):
         # KZDW-JV0666 after its TD lines were removed from QBO: rows 2-3 are still in the
@@ -246,6 +284,28 @@ class JournalLineMatchingTests(unittest.TestCase):
              self._line("Debit", 50.0, "Payment:Exchange Gain", "Weekly exchange loss from TH PGW")],
         )
         self.assertEqual(statuses, ["❌ Account Mismatch (Sheet: 'Exchange Loss' vs QBO: 'exchange gain')"])
+
+
+class ExpensePaymentAccountTests(unittest.TestCase):
+    ACCOUNTS = {"Bank:KZO Bank TH": "88", "Bank:KZO Bank PH": "89", "Exp:Fee": "11"}
+
+    def _run(self, sheet_account, qbo_account_id):
+        client = MagicMock()
+        client.query.return_value = [{"Id": "500", "DocNumber": "KZOTH1126E0001", "TxnDate": "2026-11-05",
+                                      "TotalAmt": 50.0, "AccountRef": {"value": qbo_account_id, "name": "x"}}]
+        df = pd.DataFrame([{"Exp Ref. No": "KZOTH1126E0001", "Payment Date": "2026-11-05",
+                            "Expense Line Amount": -50.0, "Account (Cr)": sheet_account, "QBO ID": "500"}])
+        resolver = AccountResolver(self.ACCOUNTS, "KZO", "R1", [])
+        return Reconciler(client, account_resolver=resolver).reconcile_expenses(df, "2026-11-01")[0]["status"]
+
+    def test_same_payment_account_matches(self):
+        self.assertEqual(self._run("KZO Bank TH", "88"), "✅ Matched")
+
+    def test_other_payment_account_is_a_mismatch(self):
+        self.assertIn("Payment Account Mismatch", self._run("KZO Bank TH", "89"))
+
+    def test_unknown_payment_account_is_reported(self):
+        self.assertIn("Payment Account not found: 'Nope'", self._run("Nope", "88"))
 
 
 if __name__ == "__main__":

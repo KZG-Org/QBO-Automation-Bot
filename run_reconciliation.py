@@ -18,6 +18,7 @@ from config import settings
 from src.connectors.gsheets_client import GSheetsClient
 from src.connectors.qbo_client import QBOClient
 from src.logic.reconciler import Reconciler
+from src.logic.account_map import AccountResolver, fetch_qbo_accounts, read_account_map
 from src.logic.month_end import is_month_end_row
 from src.utils.logger import setup_logger
 from src.logic.raw_adapter import standardize_raw_df, read_s5_raw_df, RAW_STANDARD_COLUMNS
@@ -204,8 +205,18 @@ def process_client_reconcile(
         logger.error(f"❌ Failed auth for {client_name}: {e}")
         return
 
-    # Initialize Reconciler
-    reconciler = Reconciler(qbo_client)
+    # Initialize Reconciler. Accounts are compared by QBO Id through the same resolver as
+    # Transform and Sync (Account Map tab included; read-only here).
+    try:
+        map_rows = read_account_map(gs, control_sheet_id)
+        qbo_accounts = fetch_qbo_accounts(qbo_client)
+    except Exception as e:
+        logger.error(f"❌ [{client_name}] Cannot read the Account Map tab or the QBO accounts: {e}")
+        return
+    reconciler = Reconciler(
+        qbo_client,
+        account_resolver=AccountResolver(qbo_accounts, client_name, realm_id, map_rows),
+    )
 
     for i, row in ctrl_df.iterrows():
         status = str(row.get(CTRL_COL_RECONCILE, "")).strip()

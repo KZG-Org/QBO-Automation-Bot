@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
+from src.logic.account_map import AccountResolver
 from src.logic.reconciler import Reconciler
 from src.logic.syncing import QBOSync
 from src.logic.transformer import find_id_in_map
@@ -211,39 +212,29 @@ class KzpGrowthAliasSyncTests(unittest.TestCase):
 
 
 class KzpGrowthAliasReconcileTests(unittest.TestCase):
+    """Reconcile resolves the sheet name and compares QBO account Ids (no name fuzzing)."""
+
     def _reconciler(self, client_name: str) -> Reconciler:
         client = MagicMock()
         client.client_name = client_name
-        return Reconciler(client)
+        resolver = AccountResolver(KZP_GROWTH_ACCOUNTS, client_name, "R1", [])
+        return Reconciler(client, account_resolver=resolver)
 
     def test_each_growth_form_matches_only_its_own_account(self):
         rec = self._reconciler("KZP")
 
-        self.assertTrue(rec._is_account_match("Growth", "Marketing Income:Growth"))
-        self.assertFalse(rec._is_account_match("Growth", "Marketing Expense:Growth"))
-        self.assertTrue(
-            rec._is_account_match("Growth - Marketing Expense", "Marketing Expense:Growth")
-        )
-        self.assertFalse(
-            rec._is_account_match("Growth - Marketing Expense", "Marketing Income:Growth")
-        )
+        self.assertTrue(rec._account_matches("Growth", "5010"))
+        self.assertFalse(rec._account_matches("Growth", "6010"))
+        self.assertTrue(rec._account_matches("Growth - Marketing Expense", "6010"))
+        self.assertFalse(rec._account_matches("Growth - Marketing Expense", "5010"))
 
-    def test_bare_qbo_name_falls_back_to_a_leaf_comparison(self):
-        # QBO does not always report the fully qualified path. With no parent in the payload the
-        # two 'Growth' leaves cannot be told apart, so compare leaves instead of raising a
-        # mismatch the payload cannot prove.
+    def test_suffix_names_match_but_near_names_do_not(self):
         rec = self._reconciler("KZP")
 
-        self.assertTrue(rec._is_account_match("Growth", "Growth"))
-        self.assertTrue(rec._is_account_match("Growth - Marketing Expense", "Growth"))
-        self.assertFalse(rec._is_account_match("Growth - Marketing Expense", "Affiliates"))
-
-    def test_unaliased_accounts_keep_suffix_and_fuzzy_matching(self):
-        rec = self._reconciler("KZP")
-
-        self.assertTrue(rec._is_account_match("Equipment", "Fixed Assets:Equipment"))
-        self.assertTrue(rec._is_account_match("Fixed Assets:Equipment", "Fixed Assets:Equipment"))
-        self.assertTrue(rec._is_account_match("Affiliate", "Marketing Income:Affiliates"))
+        self.assertTrue(rec._account_matches("Affiliates", "5011"))
+        self.assertTrue(rec._account_matches("Marketing Income:Affiliates", "5011"))
+        # 'Affiliate' used to pass as an 80% fuzzy match; a near name is not the account.
+        self.assertFalse(rec._account_matches("Affiliate", "5011"))
 
 
 class LeadingCardRenameTests(unittest.TestCase):
@@ -274,13 +265,9 @@ class LeadingCardRenameTests(unittest.TestCase):
     def test_reconcile_matches_the_mkt_name(self):
         client = MagicMock()
         client.client_name = "KZO"
-        rec = Reconciler(client)
+        rec = Reconciler(client, account_resolver=AccountResolver(self.QBO_ACCOUNTS, "KZO", "R1", []))
 
-        self.assertTrue(
-            rec._is_account_match(
-                "Leading Card MKT - 1238", "Employee Cash Advances:Leading Card MKT - 1238"
-            )
-        )
+        self.assertTrue(rec._account_matches("Leading Card MKT - 1238", "11191"))
 
 
 if __name__ == "__main__":

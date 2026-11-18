@@ -2,19 +2,37 @@ from __future__ import annotations
 import pandas as pd
 import calendar
 import re
-import difflib
 from config import settings
 from src.connectors.qbo_client import QBOClient
-from src.logic.account_aliases import resolve_account_alias_ex
+from src.logic.account_map import AccountResolver, fetch_qbo_accounts, normalize_qbo_id
 from src.utils.logger import setup_logger
 
 logger = setup_logger("reconciler")
 
 class Reconciler:
-    def __init__(self, qbo_client: QBOClient):
+    def __init__(self, qbo_client: QBOClient, account_resolver: AccountResolver | None = None):
         self.client = qbo_client
         self._qbo_entity_cache: dict[tuple[str, str, str], tuple[dict, dict]] = {}
         self._qbo_transfer_cache: dict[tuple[str, str], list] = {}
+        self._account_resolver = account_resolver
+
+    def _resolver(self) -> AccountResolver:
+        """The run's resolver; without one, the active QBO accounts and no Account Map."""
+        if self._account_resolver is None:
+            client_name = getattr(self.client, "client_name", "")
+            realm_id = getattr(self.client, "realm_id", "")
+            self._account_resolver = AccountResolver(
+                fetch_qbo_accounts(self.client),
+                client_name if isinstance(client_name, str) else "",
+                realm_id if isinstance(realm_id, str) else "",
+                [],
+            )
+        return self._account_resolver
+
+    def _account_matches(self, sheet_acc, qbo_account_id) -> bool:
+        """The sheet name resolves (Account Map included) to exactly this QBO account Id."""
+        acc_id = self._resolver().account_id(sheet_acc)
+        return acc_id is not None and acc_id == normalize_qbo_id(qbo_account_id)
 
     def _coerce_scalar(self, val):
         """Collapse Series/DataFrame values (from duplicate columns) into one scalar."""
@@ -168,76 +186,10 @@ class Reconciler:
         self._qbo_transfer_cache[cache_key] = out
         return out
 
-    # --- NEW: ROBUST MATCHING LOGIC (COPIED FROM SYNCING) ---
-    def _is_account_match(self, sheet_acc: str, qbo_acc: str) -> bool:
-        """
-        Returns True if sheet_acc matches qbo_acc using:
-        1. Workspace account aliases + Explicit Replacements
-        2. Exact Match
-        3. Suffix-path Match
-        4. Fuzzy Match (>80%)
-        """
-        if not sheet_acc or not qbo_acc: return False
-        
-        # 0. Basic Clean + workspace account aliases (KZP's duplicated 'Growth' leaf), so
-        #    the sheet value is compared in the same qualified form the sync stage posted.
-        sheet_clean, sheet_aliased = resolve_account_alias_ex(
-            sheet_acc, getattr(self.client, "client_name", "")
-        )
-        qbo_clean = re.sub(r'\s+', ' ', str(qbo_acc)).strip()
-        
-        # 1. Replacements (Hardcoded fixes)
-        replacements = {
-            "CBD Z Card":   "KZO CBD Z",
-        }
-        for bad_text, target_text in replacements.items():
-            if bad_text.lower() in sheet_clean.lower():
-                sheet_clean = re.sub(re.escape(bad_text), target_text, sheet_clean, flags=re.IGNORECASE)
-                break
-
-        s_lower = sheet_clean.lower()
-        q_lower = qbo_clean.lower()
-
-        # 2. EXACT MATCH
-        if s_lower == q_lower: return True
-
-        # 3. SUFFIX-PATH MATCH -- every trailing path of the QBO name, matching the
-        #    transform/sync matchers: Sheet="Equipment" or "Fixed Assets:Equipment"
-        #    both match QBO="Fixed Assets:Equipment".
-        if ":" in q_lower:
-            q_parts = [part.strip() for part in q_lower.split(":")]
-            for i in range(1, len(q_parts)):
-                if ":".join(q_parts[i:]) == s_lower:
-                    return True
-        
-        # 4. FUZZY MATCH (80%) -- never for an alias-disambiguated account. Two 'Growth'
-        #    leaves under different parents score 0.81 against each other, so fuzzy here
-        #    would pass the exact wrong-parent posting the alias table exists to catch.
-        if sheet_aliased:
-            # QBO sometimes reports a bare account Name where a fully qualified path was
-            # expected. With no parent to compare against, the two same-named leaves are
-            # indistinguishable -- compare leaves rather than report a mismatch that the
-            # QBO payload cannot actually prove.
-            if ":" not in q_lower:
-                return s_lower.split(":")[-1].strip() == q_lower
-            return False
-
-        # Check against full name
-        if difflib.SequenceMatcher(None, s_lower, q_lower).ratio() >= 0.80:
-            return True
-        
-        # Check against leaf name (often needed for fuzzy matches on sub-accounts)
-        if ":" in q_lower:
-            q_leaf = q_lower.split(":")[-1].strip()
-            if difflib.SequenceMatcher(None, s_lower, q_leaf).ratio() >= 0.80:
-                return True
-                
-        return False
-
     # --- 1. JOURNALS (UPGRADED) ---
     def reconcile_journals(self, df: pd.DataFrame, month_str: str) -> list[dict]:
         """
-        Performs Line-by-Line reconciliation with Fuzzy Matching.
+        Performs Line-by-Line reconciliation; accounts are compared by QBO Id.
         """
         if df.empty or "Journal No" not in df.columns: return []
 
@@ -281,7 +233,7 @@ class Reconciler:
             for line in qbo_record.get("Line", []):
                 detail = line.get("JournalEntryLineDetail", {})
                 
-                # STORE FULL NAME FOR FUZZY MATCHING
+                # The account is compared by Id; the name is only shown in messages.
                 full_acc_name = detail.get("AccountRef", {}).get("name", "")
                 
                 # Determine amount (Debit positive, Credit negative for matching logic)
@@ -290,7 +242,8 @@ class Reconciler:
                     amt = -amt
                 
                 qbo_lines_pool.append({
-                    "full_name": full_acc_name, # Stored for matching
+                    "account_id": detail.get("AccountRef", {}).get("value", ""),
+                    "full_name": full_acc_name,
                     "display_name": self._normalize_account(full_acc_name), # Stored for error msg
                     "amount": amt,
                     # Sync writes the sheet's Memo into each line's Description; used to break ties.
@@ -325,14 +278,18 @@ class Reconciler:
                     q_line["matched"] = True
                     status_by_idx[idx] = describe(sheet_acc_raw, sheet_amt, q_line)
 
+            def account_problem(acc, amt, q):
+                if self._resolver().account_id(acc) is None:
+                    return f"{header_status_prefix}❌ Account not found: '{acc}'"
+                return f"{header_status_prefix}❌ Account Mismatch (Sheet: '{acc}' vs QBO: '{q['display_name']}')"
+
             # Pass 1: Account AND Strict Amount Match
-            claim(lambda acc, amt, q: self._is_account_match(acc, q["full_name"]) and abs(q["amount"] - amt) < 0.01,
+            claim(lambda acc, amt, q: self._account_matches(acc, q["account_id"]) and abs(q["amount"] - amt) < 0.01,
                   lambda acc, amt, q: ok_status)
-            # Pass 2: Amount Match ONLY (Wrong Account)
-            claim(lambda acc, amt, q: abs(q["amount"] - amt) < 0.01,
-                  lambda acc, amt, q: f"{header_status_prefix}❌ Account Mismatch (Sheet: '{acc}' vs QBO: '{q['display_name']}')")
+            # Pass 2: Amount Match ONLY (Wrong Account, or a sheet name that is in no QBO account)
+            claim(lambda acc, amt, q: abs(q["amount"] - amt) < 0.01, account_problem)
             # Pass 3: Account Match ONLY (Wrong Amount)
-            claim(lambda acc, amt, q: self._is_account_match(acc, q["full_name"]),
+            claim(lambda acc, amt, q: self._account_matches(acc, q["account_id"]),
                   lambda acc, amt, q: f"{header_status_prefix}❌ Amount Mismatch (Sheet: {amt} vs QBO: {q['amount']})")
 
             for idx, sheet_acc_raw, sheet_amt, _ in pending:
@@ -386,11 +343,14 @@ class Reconciler:
             # 3. PAYMENT ACCOUNT CHECK (Account Cr)
             # This checks the main 'AccountRef' on the Purchase object (where money came FROM)
             sheet_pay_acc = str(self._row_get_scalar(row, "Account (Cr)", ""))
-            qbo_pay_acc = qbo_record.get("AccountRef", {}).get("name", "")
-            
-            # Use robust match
-            if not self._is_account_match(sheet_pay_acc, qbo_pay_acc):
-                 errors.append(f"Payment Account Mismatch: '{sheet_pay_acc}' != '{self._normalize_account(qbo_pay_acc)}'")
+            qbo_pay_ref = qbo_record.get("AccountRef", {}) or {}
+            if self._resolver().account_id(sheet_pay_acc) is None:
+                errors.append(f"Payment Account not found: '{sheet_pay_acc}'")
+            elif not self._account_matches(sheet_pay_acc, qbo_pay_ref.get("value", "")):
+                errors.append(
+                    f"Payment Account Mismatch: '{sheet_pay_acc}' != "
+                    f"'{self._normalize_account(qbo_pay_ref.get('name', ''))}'"
+                )
 
             status = "✅ Matched" if not errors else "⚠️ " + "; ".join(errors)
             updates.append({"row_idx": idx, "status": status})
