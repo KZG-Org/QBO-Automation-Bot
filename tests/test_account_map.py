@@ -642,12 +642,24 @@ class SeedLearnTests(unittest.TestCase):
         self.assertEqual(groups["leading card acc"]["name"], "Leading Card ACC")
         self.assertEqual(len(groups["leading card acc"]["samples"]), 2)
 
-    def test_each_spelling_gets_its_own_sample_quota(self):
+    def test_each_spelling_samples_its_oldest_and_newest_rows(self):
         resolver = _resolver()
-        entries = [("Expenses", "Account (Cr)", "Old Card", str(i), None) for i in range(5)]
+        entries = [("Expenses", "Account (Cr)", "Old Card", str(i), None) for i in range(7)]
         entries.append(("Expenses", "Account (Cr)", "old card", "99", None))
         samples = collect_unresolved(entries, resolver)["old card"]["samples"]
-        self.assertEqual([s[2] for s in samples], ["0", "1", "2", "99"])
+        self.assertEqual([s[2] for s in samples], ["0", "1", "4", "5", "6", "99"])
+
+    def test_a_name_whose_meaning_changed_is_not_seeded(self):
+        # KZO dry run 2026-11-18: 'Leading Card ACC' posted to 150 for months, then to 148 and
+        # 28 in October. Sampling only the oldest rows seeded it to 150 (the top parent).
+        resolver = _resolver()
+        entries = [("Expenses", "Account (Cr)", "Leading Card ACC", f"old{i}", None) for i in range(6)]
+        entries += [("Transfers", "Transfer Funds To", "Leading Card ACC", "55127", None),
+                    ("Expenses", "Account (Cr)", "Leading Card ACC", "55337", None)]
+        sampled = [s[2] for s in collect_unresolved(entries, resolver)["leading card acc"]["samples"]]
+        self.assertIn("55127", sampled)
+        self.assertIn("55337", sampled)
+        self.assertIn("old0", sampled)
 
     def test_names_that_resolve_today_are_not_collected(self):
         resolver = _resolver()

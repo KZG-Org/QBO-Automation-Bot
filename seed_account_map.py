@@ -44,7 +44,8 @@ TAB_COLUMNS = {
     "Transfers": ["Transfer Funds From", "Transfer Funds To"],
 }
 QBO_ENTITY = {"Journals": "journalentry", "Expenses": "purchase", "Transfers": "transfer"}
-SAMPLES_PER_NAME = 3
+OLDEST_SAMPLES = 2  # per spelling: the oldest synced rows ...
+NEWEST_SAMPLES = 3  # ... and the newest, so a change of meaning over time shows up
 SHEETS_PAUSE_SECONDS = 1.2  # stay under the Sheets read quota
 
 
@@ -111,26 +112,31 @@ def decide_learned(learned: list[str | None], active_ids: set[str]) -> tuple[str
     return ids[0], ""
 
 
-def collect_unresolved(entries, resolver: AccountResolver, limit: int = SAMPLES_PER_NAME) -> dict:
+def collect_unresolved(entries, resolver: AccountResolver,
+                       oldest: int = OLDEST_SAMPLES, newest: int = NEWEST_SAMPLES) -> dict:
     """Names that do not resolve today, grouped by Account Map key, with synced-row samples.
 
-    `entries` yields (kind, column, name, QBO ID, amount). Spellings that differ only in case or
-    spaces share one map row, so their samples are pooled and judged together (two spellings
-    that posted to two accounts must not be seeded). Each spelling gets its own `limit`.
+    `entries` yields (kind, column, name, QBO ID, amount), oldest tab first. Spellings that
+    differ only in case or spaces share one map row, so their samples are pooled and judged
+    together. Each spelling contributes its `oldest` and its `newest` synced rows: a name whose
+    meaning changed over time (KZO 'Leading Card ACC': account 150 for months, then 148 and 28)
+    then shows the disagreement instead of being seeded from its oldest rows only.
     Names that do resolve are left to the resolver, which records their Auto rows.
     """
     groups: dict[str, dict] = {}
-    taken: dict[tuple[str, str], int] = defaultdict(int)
+    synced: dict[tuple[str, str], list] = defaultdict(list)
     for kind, col, raw_name, qbo_id, amount in entries:
         name = cell_text(raw_name)
         if not name or resolver.resolve(name).ok:
             continue
         key = map_key(name)
-        group = groups.setdefault(key, {"name": name, "samples": []})
+        groups.setdefault(key, {"name": name, "samples": []})
         qid = normalize_qbo_id(qbo_id)
-        if qid and taken[(key, name)] < limit:
-            taken[(key, name)] += 1
-            group["samples"].append((kind, col, qid, amount))
+        if qid:
+            synced[(key, name)].append((kind, col, qid, amount))
+    for (key, _), rows in synced.items():
+        picked = rows if len(rows) <= oldest + newest else rows[:oldest] + rows[-newest:]
+        groups[key]["samples"].extend(picked)
     return groups
 
 
@@ -195,6 +201,7 @@ def seed_client(gs, qbo: QBOClient, client: str, realm: str, sheet_id: str, writ
     print(f"   tabs read: {len(tabs_read)}, names not resolving today: {len(groups)}")
 
     active_ids = set(accounts.values())
+    accounts_by_id = {acc_id: name for name, acc_id in accounts.items()}
     not_seeded: dict[str, str] = {}
     for key in sorted(groups):
         name = groups[key]["name"]
@@ -210,6 +217,8 @@ def seed_client(gs, qbo: QBOClient, client: str, realm: str, sheet_id: str, writ
                 print(f"   ! cannot read QBO {QBO_ENTITY[kind]} {qbo_id}: {str(e)[:120]}")
         acc_id, why = decide_learned(learned, active_ids)
         if acc_id:
+            print(f"   LEARNED '{name}' -> {acc_id} '{accounts_by_id.get(acc_id, '')}' "
+                  f"from {len(learned)} synced row(s)")
             resolver.remember(name, acc_id)
         else:
             not_seeded[name] = why
