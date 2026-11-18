@@ -79,6 +79,37 @@ def learn_account_id(kind: str, column: str, txn: dict, sheet_amount: float | No
     return None
 
 
+def cell_text(value) -> str:
+    """A sheet cell as trimmed text; empty for None / NaN / pd.NA."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return "" if text.lower() in ("nan", "none") else text
+
+
+def decide_learned(learned: list[str | None], active_ids: set[str]) -> tuple[str | None, str]:
+    """(account Id to seed, '') or (None, why not).
+
+    A row that told nothing (None: deleted in QBO, or 2 lines with the same amount) is not a
+    disagreement. Two different Ids are.
+    """
+    if not learned:
+        return None, "no synced rows"
+    ids = sorted({i for i in learned if i})
+    if not ids:
+        return None, "no row told the account"
+    if len(ids) > 1:
+        return None, f"posted to {ids}"
+    if ids[0] not in active_ids:
+        return None, f"account {ids[0]} is not active in QBO"
+    return ids[0], ""
+
+
 def _amount(value) -> float | None:
     try:
         return float(str(value).replace(",", ""))
@@ -134,8 +165,8 @@ def seed_client(gs, qbo: QBOClient, client: str, realm: str, sheet_id: str, writ
         tabs += 1
         for _, row in df.iterrows():
             for col in TAB_COLUMNS[kind]:
-                name = str(row.get(col, "") or "").strip()
-                if not name or name.lower() in ("nan", "none"):
+                name = cell_text(row.get(col, ""))
+                if not name:
                     continue
                 if resolver.resolve(name).ok:
                     continue
@@ -148,22 +179,21 @@ def seed_client(gs, qbo: QBOClient, client: str, realm: str, sheet_id: str, writ
     active_ids = set(accounts.values())
     not_seeded: dict[str, str] = {}
     for name in sorted(unresolved):
-        learned = set()
+        learned: list[str | None] = []
         for kind, col, qbo_id, amount in samples.get(name, []):
             try:
                 data = qbo._get(f"/v3/company/{qbo.realm_id}/{QBO_ENTITY[kind]}/{qbo_id}"
                                 f"?minorversion={settings.QBO_MINOR_VERSION}")
                 txn = next((v for v in data.values() if isinstance(v, dict)), {})
-                learned.add(learn_account_id(kind, col, txn, amount))
+                learned.append(learn_account_id(kind, col, txn, amount))
             except Exception as e:  # noqa: BLE001
-                learned.add(None)
-                print(f"   ! cannot read QBO {QBO_ENTITY[kind]} {qbo_id}: {e}")
-        if not learned:
-            not_seeded[name] = "no synced rows"
-        elif len(learned) == 1 and None not in learned and next(iter(learned)) in active_ids:
-            resolver.remember(name, next(iter(learned)))
+                learned.append(None)
+                print(f"   ! cannot read QBO {QBO_ENTITY[kind]} {qbo_id}: {str(e)[:120]}")
+        acc_id, why = decide_learned(learned, active_ids)
+        if acc_id:
+            resolver.remember(name, acc_id)
         else:
-            not_seeded[name] = f"posted to {sorted(str(i) for i in learned)}"
+            not_seeded[name] = why
 
     pending = resolver.pending_rows()
     for row in sorted(pending, key=lambda r: r.sheet_name.lower()):

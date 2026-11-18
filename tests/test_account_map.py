@@ -7,7 +7,7 @@ import pandas as pd
 import run_ingestion
 import run_reconciliation
 import run_syncing
-from seed_account_map import learn_account_id
+from seed_account_map import cell_text, decide_learned, learn_account_id
 from src.connectors.gsheets_client import GSheetsClient
 from src.logic import month_end
 from src.logic.syncing import QBOSync
@@ -559,6 +559,30 @@ class SeedLearnTests(unittest.TestCase):
 
     def test_unknown_column_learns_nothing(self):
         self.assertIsNone(learn_account_id("Journals", "Memo", {"Line": []}, 1.0))
+
+    def test_empty_cells_read_as_blank(self):
+        # KZO dry run 2026-11-18: an empty cell came back as pd.NA and `value or ""` raised.
+        self.assertEqual(cell_text(pd.NA), "")
+        self.assertEqual(cell_text(float("nan")), "")
+        self.assertEqual(cell_text(None), "")
+        self.assertEqual(cell_text("  Leading Card ACC  "), "Leading Card ACC")
+
+    def test_rows_that_cannot_be_read_do_not_block_the_others(self):
+        # S5 dry run: one 'Recruitment Fee' purchase was deleted in QBO (None), the others
+        # posted to 155. A row that tells nothing is not a disagreement.
+        self.assertEqual(decide_learned(["155", None], {"155"}), ("155", ""))
+
+    def test_rows_posted_to_two_accounts_are_not_seeded(self):
+        acc_id, why = decide_learned(["148", "28"], {"148", "28"})
+        self.assertIsNone(acc_id)
+        self.assertEqual(why, "posted to ['148', '28']")
+
+    def test_nothing_learned_is_not_seeded(self):
+        self.assertEqual(decide_learned([], {"1"}), (None, "no synced rows"))
+        self.assertEqual(decide_learned([None], {"1"}), (None, "no row told the account"))
+
+    def test_an_inactive_learned_account_is_not_seeded(self):
+        self.assertEqual(decide_learned(["9"], {"1"}), (None, "account 9 is not active in QBO"))
 
 
 if __name__ == "__main__":
