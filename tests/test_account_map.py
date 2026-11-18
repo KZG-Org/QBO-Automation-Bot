@@ -7,6 +7,7 @@ import pandas as pd
 import run_ingestion
 import run_reconciliation
 import run_syncing
+from seed_account_map import learn_account_id
 from src.connectors.gsheets_client import GSheetsClient
 from src.logic import month_end
 from src.logic.syncing import QBOSync
@@ -517,6 +518,47 @@ class ReconcileAccountMapTests(unittest.TestCase):
         rec_cls, ctrl = self._run_reconcile(boom)
         rec_cls.assert_not_called()
         ctrl.assert_not_called()
+
+
+def _jline(side, amount, acc_id):
+    return {"Amount": amount, "DetailType": "JournalEntryLineDetail",
+            "JournalEntryLineDetail": {"PostingType": side, "AccountRef": {"value": acc_id}}}
+
+
+def _eline(acc_id):
+    return {"Amount": 50, "DetailType": "AccountBasedExpenseLineDetail",
+            "AccountBasedExpenseLineDetail": {"AccountRef": {"value": acc_id}}}
+
+
+class SeedLearnTests(unittest.TestCase):
+    def test_expense_payment_account_comes_from_the_purchase(self):
+        txn = {"AccountRef": {"value": "88"}, "Line": [_eline("5")]}
+        self.assertEqual(learn_account_id("Expenses", "Account (Cr)", txn, None), "88")
+
+    def test_expense_account_comes_from_the_only_expense_line(self):
+        txn = {"AccountRef": {"value": "88"}, "Line": [_eline("5")]}
+        self.assertEqual(learn_account_id("Expenses", "Expense Account (Dr)", txn, None), "5")
+
+    def test_two_expense_lines_learn_nothing(self):
+        txn = {"AccountRef": {"value": "88"}, "Line": [_eline("5"), _eline("6")]}
+        self.assertIsNone(learn_account_id("Expenses", "Expense Account (Dr)", txn, None))
+
+    def test_transfer_sides_come_from_from_and_to(self):
+        txn = {"FromAccountRef": {"value": "1"}, "ToAccountRef": {"value": "2"}}
+        self.assertEqual(learn_account_id("Transfers", "Transfer Funds From", txn, None), "1")
+        self.assertEqual(learn_account_id("Transfers", "Transfer Funds To", txn, None), "2")
+
+    def test_journal_line_is_found_by_amount_and_side(self):
+        txn = {"Line": [_jline("Debit", 100.0, "7"), _jline("Credit", 100.0, "8")]}
+        self.assertEqual(learn_account_id("Journals", "Account", txn, 100.0), "7")
+        self.assertEqual(learn_account_id("Journals", "Account", txn, -100.0), "8")
+
+    def test_two_journal_lines_with_the_same_amount_learn_nothing(self):
+        txn = {"Line": [_jline("Debit", 100.0, "7"), _jline("Debit", 100.0, "9"), _jline("Credit", 200.0, "8")]}
+        self.assertIsNone(learn_account_id("Journals", "Account", txn, 100.0))
+
+    def test_unknown_column_learns_nothing(self):
+        self.assertIsNone(learn_account_id("Journals", "Memo", {"Line": []}, 1.0))
 
 
 if __name__ == "__main__":
