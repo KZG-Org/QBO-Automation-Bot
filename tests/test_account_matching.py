@@ -69,10 +69,12 @@ class AccountMatchingTests(unittest.TestCase):
         )
         self.assertEqual(acc_id, "1150040132")
 
-    def test_hardcoded_replacements_still_apply_without_fuzzy(self):
+    def test_cbd_z_card_is_no_longer_rewritten(self):
+        # The hardcoded 'CBD Z Card' -> 'KZO CBD Z' rule is gone: QBO renamed that account, and
+        # renames are now handled by the Account Map tab.
         mapping = {"Bank:KZO CBD Z": "900"}
 
-        self.assertEqual(find_id_in_map(mapping, "CBD Z Card", allow_fuzzy=False), "900")
+        self.assertIsNone(find_id_in_map(mapping, "CBD Z Card", allow_fuzzy=False))
 
     def test_fuzzy_still_available_for_non_account_maps(self):
         # Vendors/classes/locations keep fuzzy -- names there genuinely vary and a wrong

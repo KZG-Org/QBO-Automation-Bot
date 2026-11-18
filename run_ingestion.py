@@ -35,6 +35,7 @@ from src.logic.month_end import (
     read_source_tab,
     transform_note,
 )
+from src.logic.account_map import AccountResolver, read_account_map, write_account_map_changes
 from src.utils.run_lock import single_instance_lock
 
 logger = setup_logger("ingestion")
@@ -778,6 +779,33 @@ def process_client_control_sheet(
     client_name: str,
     realm_id: str,
 ):
+    """Process the client's 'READY' jobs, then save what the Account Map learned.
+
+    The save runs even when a row stops the run, so a renamed account learned before the
+    failure is still remembered next time. A failed save never fails the run.
+    """
+    run_state: dict = {}
+    try:
+        _process_client_control_sheet(gs, qbo_client, control_sheet_id, client_name, realm_id, run_state)
+    finally:
+        resolver = run_state.get("account_resolver")
+        if resolver is not None:
+            try:
+                saved = write_account_map_changes(gs, control_sheet_id, resolver.pending_rows())
+                if saved:
+                    logger.info(f"   🗺️ [{client_name}] Account Map: saved {saved} row(s).")
+            except Exception as e:
+                logger.error(f"   ❌ [{client_name}] Could not save the Account Map tab: {e}")
+
+
+def _process_client_control_sheet(
+    gs: GSheetsClient,
+    qbo_client: QBOClient,
+    control_sheet_id: str,
+    client_name: str,
+    realm_id: str,
+    run_state: dict,
+):
     """
     Reads the specific Client's Control Sheet and processes all 'READY' jobs.
     """
@@ -825,6 +853,19 @@ def process_client_control_sheet(
     except Exception as e:
         logger.error(f"   ❌ [{client_name}] Failed to fetch mappings. Check Realm ID/Token. Error: {e}")
         return
+
+    # --- C2. Account Map tab (README "Account Map tab") ---
+    # Read before any control row is touched: a Manual row may be what keeps a row off the
+    # wrong account, so a run never goes ahead without the map.
+    try:
+        map_rows = read_account_map(gs, control_sheet_id)
+    except Exception as e:
+        logger.error(f"   ❌ [{client_name}] Cannot read the Account Map tab: {e}")
+        return
+    account_resolver = AccountResolver(qbo_mappings.get("accounts", {}), client_name, realm_id, map_rows)
+    qbo_mappings["account_resolver"] = account_resolver
+    run_state["account_resolver"] = account_resolver
+    logger.info(f"   🗺️ [{client_name}] Account Map: {len(map_rows)} row(s).")
 
     # --- Constants for this Client ---
     COL_LAST_JV = "Last Journal No"

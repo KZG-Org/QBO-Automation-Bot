@@ -1,9 +1,13 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import gspread
+import pandas as pd
 
+import run_ingestion
 from src.connectors.gsheets_client import GSheetsClient
+from src.logic import month_end
+from src.logic.transformer import process_expenses, process_transfers
 from src.logic.account_map import (
     ACCOUNT_MAP_HEADERS,
     ACCOUNT_MAP_TAB,
@@ -315,6 +319,98 @@ class WriteValuesRawTests(unittest.TestCase):
         gs, sh, _ = self._gs()
         gs.write_values_raw("sid", ACCOUNT_MAP_TAB, [])
         gs.open.assert_not_called()
+
+
+RENAMED_ACCOUNTS = {
+    "Leading Card:Leading Card ACCT:Leading Card ACC - 3214": "28",
+    "Bank:KZO Bank TH": "88",
+    "Expense:AI Expenses": "5",
+}
+RENAMED_ROW = MapRow("Leading Card ACCT - 3214", "old name", "28", "Auto", "R1")
+
+
+def _mappings(rows):
+    return {
+        "accounts": RENAMED_ACCOUNTS,
+        "locations": {},
+        "account_resolver": AccountResolver(RENAMED_ACCOUNTS, "KZO", "R1", rows),
+    }
+
+
+def _raw_transfer(from_name, to_name):
+    return pd.DataFrame([{
+        "No": 1, "Date": "2026-07-15", "USD - QBO": 100.0, "QBO Method": "Transfer",
+        "QBO Transfer Fr": from_name, "QBO Transfer To": to_name,
+        "Item Description": "moving funds", "CO": "", "Type": "",
+    }])
+
+
+def _raw_expense(src, exp):
+    return pd.DataFrame([{
+        "No": 1, "Date": "2026-07-15", "USD - QBO": -50.0, "QBO Method": "Expense",
+        "If Journal/Expense Method": src, "Type": exp, "Item Description": "fee", "CO": "",
+    }])
+
+
+class TransformIntegrationTests(unittest.TestCase):
+    def test_renamed_account_passes_with_an_auto_row(self):
+        out, _ = process_transfers(
+            _raw_transfer("Leading Card ACCT - 3214", "KZO Bank TH"), country="TH", start_no=0,
+            qbo_mappings=_mappings([RENAMED_ROW]), client_name="KZO",
+        )
+        self.assertEqual(out["Remarks"].iloc[0], "Ready to sync")
+
+    def test_unknown_account_error_names_the_closest_and_the_tab(self):
+        out, _ = process_expenses(
+            _raw_expense("Leading Card ACCT - 3214", "AI Expenses"), country="TH", start_no=0,
+            qbo_mappings=_mappings([]), client_name="KZO",
+        )
+        remark = out["Remarks"].iloc[0]
+        self.assertTrue(
+            remark.startswith("ERROR | Source Account not in QBO: 'Leading Card ACCT - 3214'. Closest in QBO: "),
+            remark,
+        )
+        self.assertIn("add it to the Account Map tab", remark)
+        self.assertNotIn("Available:", remark)
+
+    def test_month_end_line_uses_the_auto_row(self):
+        line = pd.Series({"Date": "2026-10-31", "Account": "Leading Card ACCT - 3214",
+                          "Amount": "100", "Location": "", "Class": "", "Currency Code": "USD"})
+        self.assertIsNone(month_end._line_error(line, "KZO", _mappings([RENAMED_ROW])))
+
+
+class IngestionAccountMapTests(unittest.TestCase):
+    CTRL = pd.DataFrame([{"Country": "TH", "Transform": "READY", "Last Journal No": "0",
+                          "Pending Nos Note": ""}])
+
+    def _run(self, read_map):
+        gs = MagicMock()
+        gs.read_as_df.return_value = self.CTRL.copy()
+        sync = MagicMock()
+        sync.mappings = {"accounts": {"Bank:KZO Bank TH": "88"}, "locations": {}}
+        with patch.object(run_ingestion, "QBOSync", return_value=sync), \
+             patch.object(run_ingestion, "read_account_map", side_effect=read_map), \
+             patch.object(run_ingestion, "write_account_map_changes") as write, \
+             patch.object(run_ingestion, "_batch_update_control", side_effect=RuntimeError("stop")) as ctrl:
+            try:
+                run_ingestion.process_client_control_sheet(gs, MagicMock(), "ctrl", "KZO", "R1")
+            except RuntimeError:
+                pass
+        return sync, write, ctrl
+
+    def test_the_map_is_saved_even_when_a_row_stops_the_run(self):
+        sync, write, ctrl = self._run(lambda gs, sid: [])
+        ctrl.assert_called()  # the loop started
+        write.assert_called_once()
+        self.assertIs(write.call_args[0][2].__class__, list)
+        self.assertIsInstance(sync.mappings["account_resolver"], AccountResolver)
+
+    def test_ingestion_stops_when_the_map_cannot_be_read(self):
+        def boom(gs, sid):
+            raise RuntimeError("429 quota")
+        _, write, ctrl = self._run(boom)
+        ctrl.assert_not_called()
+        write.assert_not_called()
 
 
 if __name__ == "__main__":

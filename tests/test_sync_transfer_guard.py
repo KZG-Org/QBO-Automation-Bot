@@ -35,13 +35,12 @@ def _transfer_row(from_name: str, to_name: str) -> pd.Series:
 
 class TransferSameAccountTests(unittest.TestCase):
     def test_same_resolved_account_is_blocked_before_posting(self):
-        # 'CBD Z Card' is rewritten to 'KZO CBD Z' by find_id's explicit replacements, so two
-        # different sheet names reach QBO as one account Id -- which QBO answers with a bare
-        # 400 Bad Request on /transfer.
-        sync = _sync_with_accounts({"KZO CBD Z": "77"})
+        # The leaf name and the full path are two different sheet names for one account Id --
+        # which QBO answers with a bare 400 Bad Request on /transfer.
+        sync = _sync_with_accounts({"Bank:KZO CBD Z": "77"})
 
         with self.assertRaises(ValueError) as ctx:
-            sync.push_transfer(_transfer_row("CBD Z Card", "KZO CBD Z"))
+            sync.push_transfer(_transfer_row("KZO CBD Z", "Bank:KZO CBD Z"))
 
         self.assertIn("same QBO account", str(ctx.exception))
         self.assertIn("77", str(ctx.exception))
@@ -86,10 +85,10 @@ class TransformSameAccountTests(unittest.TestCase):
 
     def test_same_resolved_account_is_flagged_in_remarks(self):
         out, _ = process_transfers(
-            _raw_transfer_df("CBD Z Card", "KZO CBD Z"),
+            _raw_transfer_df("KZO CBD Z", "Bank:KZO CBD Z"),
             country="TH",
             start_no=0,
-            qbo_mappings={"accounts": {"KZO CBD Z": "77"}, "locations": {}},
+            qbo_mappings={"accounts": {"Bank:KZO CBD Z": "77"}, "locations": {}},
             client_name="KZO",
         )
 

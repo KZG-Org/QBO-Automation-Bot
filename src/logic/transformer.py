@@ -7,6 +7,7 @@ import difflib
 from config import settings
 import re
 from src.logic.account_aliases import resolve_account_alias
+from src.logic.account_map import resolve_account
 
 # --- CONSTANTS ---
 DEFAULT_JV_PREFIX = "KZO-JV"
@@ -96,21 +97,8 @@ def find_id_in_map(
     clean_name = resolve_account_alias(search_name, client_name)
     search_lower = clean_name.lower()
 
-    # 2. Explicit Replacements (Hardcoded fixes)
-    replacements = {
-        "CBD Z Card":   "KZO CBD Z",
-    }
-
-    for bad_text, target_text in replacements.items():
-        # Check if the bad text exists (Case Insensitive)
-        if bad_text.lower() in clean_name.lower():
-            # regex sub: Replace ONLY the bad_text part with target_text
-            # flags=re.IGNORECASE ensures "cbd z card" matches "CBD Z Card"
-            clean_name = re.sub(re.escape(bad_text), target_text, clean_name, flags=re.IGNORECASE)
-            
-            # Update the search variable for the next steps
-            search_lower = clean_name.lower()
-            break
+    # Account names are resolved by src/logic/account_map.py (Account Map tab); the old
+    # hardcoded rewrites ('CBD Z Card' -> 'KZO CBD Z') pointed at names QBO no longer has.
 
     # --- STRATEGY 1: EXACT FULL MATCH ---
     # Checks "Fixed Assets:Equipment" == "Fixed Assets:Equipment"
@@ -147,7 +135,8 @@ def find_id_in_map(
 
     # --- STRATEGY 3: FUZZY MATCH (80%) -- disabled for accounts ---
     # Only allows very close matches (typos), rejects partial substrings.
-    # Callers resolving ACCOUNTS pass allow_fuzzy=False: a chart of accounts routinely holds
+    # Accounts no longer come through here (src/logic/account_map.py resolves them, never
+    # fuzzy); allow_fuzzy=False stays for any caller that must not guess. A chart of accounts holds
     # siblings differing only by a short code ("Investment in HR Company (ORZ)" vs "(OSR)"
     # scores 0.82 against the fully-qualified names), so a fuzzy guess would silently book to
     # the wrong account. Better to fail and let a human fix the sheet.
@@ -939,9 +928,10 @@ def process_journals(df: pd.DataFrame, start_no: int, qbo_mappings: Dict[str, di
         if _is_blank(acc_name):
             return f"ERROR | Missing Account Name | Row No: {row_no}"
         
-        acc_id = find_id_in_map(map_acc, acc_name, allow_fuzzy=False, client_name=client_name)
+        acc = resolve_account(qbo_mappings, acc_name, client_name)
+        acc_id = acc.account_id
         if not acc_id:
-            return f"ERROR | Account not found: '{acc_name}' | Row No: {row_no}"
+            return f"ERROR | Account not found: '{acc_name}'. {acc.detail} | Row No: {row_no}"
 
         if _is_kzdw_case(client_name) and not _should_check_currency_transfer_only(client_name):
             mismatch_error = _currency_mismatch_error(
@@ -1093,15 +1083,15 @@ def process_expenses(df: pd.DataFrame, country: str,
         src_acc = row["Account (Cr)"]
         exp_acc = row["Expense Account (Dr)"]
         
-        src_acc_id = find_id_in_map(map_acc, src_acc, allow_fuzzy=False, client_name=client_name)
+        src = resolve_account(qbo_mappings, src_acc, client_name)
+        src_acc_id = src.account_id
         if not src_acc_id:
-            available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
-            return f"ERROR | Source Account not in QBO: '{src_acc}' | Available: {available}... | Row No: {row_no}"
-             
-        exp_acc_id = find_id_in_map(map_acc, exp_acc, allow_fuzzy=False, client_name=client_name)
+            return f"ERROR | Source Account not in QBO: '{src_acc}'. {src.detail} | Row No: {row_no}"
+
+        exp = resolve_account(qbo_mappings, exp_acc, client_name)
+        exp_acc_id = exp.account_id
         if not exp_acc_id:
-            available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
-            return f"ERROR | Expense Account not in QBO: '{exp_acc}' | Available: {available}... | Row No: {row_no}"
+            return f"ERROR | Expense Account not in QBO: '{exp_acc}'. {exp.detail} | Row No: {row_no}"
 
         if _is_kzdw_case(client_name) and not _should_check_currency_transfer_only(client_name):
             mismatch_error = _currency_mismatch_error(
@@ -1230,15 +1220,15 @@ def process_transfers(df: pd.DataFrame, country: str,
         from_acc = row["Transfer Funds From"]
         to_acc = row["Transfer Funds To"]
         
-        from_acc_id = find_id_in_map(map_acc, from_acc, allow_fuzzy=False, client_name=client_name)
+        frm = resolve_account(qbo_mappings, from_acc, client_name)
+        from_acc_id = frm.account_id
         if not from_acc_id:
-            available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
-            return f"ERROR | 'From' Account not in QBO: '{from_acc}' | Available: {available}... | Row No: {row_no}"
-             
-        to_acc_id = find_id_in_map(map_acc, to_acc, allow_fuzzy=False, client_name=client_name)
+            return f"ERROR | 'From' Account not in QBO: '{from_acc}'. {frm.detail} | Row No: {row_no}"
+
+        to = resolve_account(qbo_mappings, to_acc, client_name)
+        to_acc_id = to.account_id
         if not to_acc_id:
-            available = ', '.join(list(map_acc.keys())[:3]) if map_acc else 'NONE'
-            return f"ERROR | 'To' Account not in QBO: '{to_acc}' | Available: {available}... | Row No: {row_no}"
+            return f"ERROR | 'To' Account not in QBO: '{to_acc}'. {to.detail} | Row No: {row_no}"
 
         row_currency_code = _normalize_currency_code(row.get("Currency", "USD"))
         if _should_check_transfer_currency(client_name) and row_currency_code == "USD":
@@ -1256,10 +1246,9 @@ def process_transfers(df: pd.DataFrame, country: str,
         if row["Transfer Funds From"] == row["Transfer Funds To"]: 
             return f"ERROR | 'From' and 'To' Accounts cannot be the same | Row No: {row_no}"
 
-        # Two different names can still resolve to one QBO account -- via the explicit
-        # replacements above ("CBD Z Card" -> "KZO CBD Z") or a leaf name matching a
-        # sub-account. QBO answers such a transfer with a bare 400 Bad Request, so catch it
-        # here where the row can be fixed instead of at sync time.
+        # Two different names can still resolve to one QBO account -- via an Account Map row
+        # or a leaf name matching a sub-account. QBO answers such a transfer with a bare
+        # 400 Bad Request, so catch it here where the row can be fixed instead of at sync time.
         if from_acc_id == to_acc_id:
             return (
                 f"ERROR | 'From' and 'To' resolve to the same QBO account (Id {from_acc_id}): "

@@ -22,6 +22,7 @@ from decimal import ROUND_HALF_UP, Decimal
 import pandas as pd
 
 from config import settings
+from src.logic.account_map import resolve_account
 from src.logic.syncing import _parse_date_yyyy_mm_dd
 from src.logic.transformer import (
     _build_id_prefixes,
@@ -219,7 +220,7 @@ def _line_error(row: pd.Series, client_name: str, qbo_mappings: dict) -> str | N
         return f"Amount '{_norm_text(row['Amount'])}' is not a number"
     if amount is None or amount == 0:
         return "Missing Amount"
-    if not find_id_in_map(qbo_mappings.get("accounts", {}), account, allow_fuzzy=False, client_name=client_name):
+    if not resolve_account(qbo_mappings, account, client_name).ok:
         return f"Account not found: '{account}'"
     if not _is_s5_or_umber_case(client_name):
         location = _fix_grp(_norm_text(row["Location"]))
