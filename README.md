@@ -562,6 +562,14 @@ To send a sheet name to an account yourself, add a row: type `Sheet Name` and `Q
 wins over everything else. The bot never changes the `Sheet Name`, `QBO Account` or `Type` you
 typed.
 
+- To change an existing **Auto** row, also set its `Type` to `Manual` (or clear it). The bot
+  rewrites Auto rows, so an edit to a row that stays `Auto` is lost.
+- Do not copy a row to make a new one: leave `QBO ID` and `Realm ID` blank and let the bot fill
+  them. A copied `QBO ID` is only used when your `QBO Account` name no longer exists in QBO.
+- Keep the header on **row 1**. The bot freezes row 1 so a sort cannot move it. If row 1 is not
+  the header (a title row above it, or a sort with row 1 unfrozen), Transform, Sync and
+  Reconcile stop with `Cannot read the Account Map tab` instead of ignoring your rows.
+
 Errors and what to do:
 
 | Remarks says | Do this |
@@ -573,8 +581,9 @@ Errors and what to do:
 Rules:
 
 - **Only Transform writes the tab**, once at the end of each client run, and only new or changed
-  rows. It reads the tab again just before writing and matches rows by `Sheet Name`, so sorting
-  or inserting rows while it runs is safe. Sync and Reconcile only read it.
+  rows. It reads the tab again just before writing and matches rows by `Sheet Name`, so adding,
+  deleting or sorting rows below the header while it runs is safe. Sync and Reconcile only read
+  it.
 - A `QBO ID` counts only for the company in its `Realm ID`. A tab copied from another company's
   Control Sheet does not post to that company's accounts.
 - If the tab cannot be read (for example a Sheets quota error), that client's Transform, Sync or

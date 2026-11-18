@@ -7,7 +7,7 @@ import pandas as pd
 import run_ingestion
 import run_reconciliation
 import run_syncing
-from seed_account_map import cell_text, decide_learned, learn_account_id
+from seed_account_map import cell_text, collect_unresolved, decide_learned, learn_account_id
 from src.connectors.gsheets_client import GSheetsClient
 from src.logic import month_end
 from src.logic.syncing import QBOSync
@@ -15,6 +15,7 @@ from src.logic.transformer import process_expenses, process_transfers
 from src.logic.account_map import (
     ACCOUNT_MAP_HEADERS,
     ACCOUNT_MAP_TAB,
+    AccountMapError,
     AccountResolver,
     MapRow,
     fetch_qbo_accounts,
@@ -100,6 +101,15 @@ class AccountResolverTests(unittest.TestCase):
         self.assertEqual(
             res.detail, "Account Map row for 'Foo' points to 'Gone Account', which is not in QBO"
         )
+
+    def test_ambiguous_manual_text_uses_the_saved_id_only_if_it_is_one_of_them(self):
+        # Review finding 2: a copied row kept QBO ID 210 (CBD Z 1); its text 'Growth' matches
+        # 2 accounts. 210 is not one of them, so the row must stop, not post to 210.
+        res = _resolver([MapRow("Foo", "Growth", "210", "Manual", "R1")]).resolve("Foo")
+        self.assertEqual(res.how, "manual_broken")
+        self.assertIn("matches more than one QBO account", res.detail)
+        r = _resolver([MapRow("Foo", "Growth", "702", "Manual", "R1")])
+        self.assertEqual(r.account_id("Foo"), "702")
 
     def test_blank_type_counts_as_manual(self):
         res = _resolver([MapRow("Foo", "Cash On Hand:CBD Z 1", type="")]).resolve("Foo")
@@ -206,8 +216,9 @@ class _FakeGs:
             raise self.grid
         return self.grid
 
-    def write_values_raw(self, sheet_id, tab, updates, create_if_missing=False):
-        self.writes.append({"tab": tab, "updates": updates, "create": create_if_missing})
+    def write_values_raw(self, sheet_id, tab, updates, create_if_missing=False, freeze_rows=0):
+        self.writes.append({"tab": tab, "updates": updates, "create": create_if_missing,
+                            "freeze_rows": freeze_rows})
 
 
 def _ranges(call):
@@ -281,6 +292,32 @@ class AccountMapTabTests(unittest.TestCase):
         self.assertEqual(call["updates"][0], ("A1", [HEADER]))
         self.assertIn("A2", _ranges(call))
 
+    def test_sorted_tab_without_header_on_row_1_stops_the_read(self):
+        # Review finding 1: 'Sort A to Z' with row 1 not frozen moved the header down. Reading it
+        # as empty would ignore every Manual row and post to the account the team overrode.
+        sorted_grid = [["Foo", "Leading Card ACC - 3214", "", "Manual", "", ""], HEADER]
+        with self.assertRaises(AccountMapError):
+            read_account_map(_FakeGs(sorted_grid), "sid")
+
+    def test_title_row_above_the_header_stops_the_read(self):
+        with self.assertRaises(AccountMapError):
+            read_account_map(_FakeGs([["Account Map for KZO"], HEADER, ["A", "x", "1", "Auto", "R1", ""]]), "sid")
+
+    def test_fully_empty_tab_reads_as_empty(self):
+        self.assertEqual(read_account_map(_FakeGs([]), "sid"), [])
+        self.assertEqual(read_account_map(_FakeGs([["", ""], [""]]), "sid"), [])
+
+    def test_write_refuses_a_tab_without_header_on_row_1(self):
+        gs = _FakeGs([["Foo", "x", "", "Manual", "", ""], HEADER])
+        with self.assertRaises(AccountMapError):
+            write_account_map_changes(gs, "sid", [_auto("New")])
+        self.assertEqual(gs.writes, [])
+
+    def test_writes_ask_for_the_header_row_to_be_frozen(self):
+        gs = _FakeGs([HEADER])
+        write_account_map_changes(gs, "sid", [_auto("A")])
+        self.assertEqual(gs.writes[0]["freeze_rows"], 1)
+
     def test_missing_header_columns_are_added_to_the_right(self):
         gs = _FakeGs([["Sheet Name", "QBO Account", "QBO ID", "Type"], ["A", "x", "1", "Auto"]])
         write_account_map_changes(gs, "sid", [_auto("A", row_num=2)])
@@ -319,6 +356,17 @@ class WriteValuesRawTests(unittest.TestCase):
         gs2, _, _ = self._gs(tab_exists=False)
         with self.assertRaises(gspread.exceptions.WorksheetNotFound):
             gs2.write_values_raw("sid", ACCOUNT_MAP_TAB, [("A1", [HEADER])])
+
+    def test_freezes_the_header_row_when_asked(self):
+        gs, _, ws = self._gs()
+        ws.frozen_row_count = 0
+        gs.write_values_raw("sid", ACCOUNT_MAP_TAB, [("A2", [["x"]])], freeze_rows=1)
+        ws.freeze.assert_called_once_with(rows=1)
+
+        gs2, _, ws2 = self._gs()
+        ws2.frozen_row_count = 1
+        gs2.write_values_raw("sid", ACCOUNT_MAP_TAB, [("A2", [["x"]])], freeze_rows=1)
+        ws2.freeze.assert_not_called()
 
     def test_no_updates_makes_no_call(self):
         gs, sh, _ = self._gs()
@@ -580,6 +628,32 @@ class SeedLearnTests(unittest.TestCase):
     def test_nothing_learned_is_not_seeded(self):
         self.assertEqual(decide_learned([], {"1"}), (None, "no synced rows"))
         self.assertEqual(decide_learned([None], {"1"}), (None, "no row told the account"))
+
+    def test_two_spellings_of_one_name_are_judged_together(self):
+        # Review finding 3: 'Leading Card ACC' posted to 148, 'leading card ACC' posted to 28.
+        # One map row covers both spellings, so their samples must be pooled.
+        resolver = _resolver()
+        entries = [
+            ("Transfers", "Transfer Funds To", "Leading Card ACC", "55127", None),
+            ("Expenses", "Account (Cr)", "leading card  ACC", "55337", None),
+        ]
+        groups = collect_unresolved(entries, resolver)
+        self.assertEqual(list(groups), ["leading card acc"])
+        self.assertEqual(groups["leading card acc"]["name"], "Leading Card ACC")
+        self.assertEqual(len(groups["leading card acc"]["samples"]), 2)
+
+    def test_each_spelling_gets_its_own_sample_quota(self):
+        resolver = _resolver()
+        entries = [("Expenses", "Account (Cr)", "Old Card", str(i), None) for i in range(5)]
+        entries.append(("Expenses", "Account (Cr)", "old card", "99", None))
+        samples = collect_unresolved(entries, resolver)["old card"]["samples"]
+        self.assertEqual([s[2] for s in samples], ["0", "1", "2", "99"])
+
+    def test_names_that_resolve_today_are_not_collected(self):
+        resolver = _resolver()
+        groups = collect_unresolved([("Expenses", "Account (Cr)", "CBD Z 1", "1", None)], resolver)
+        self.assertEqual(groups, {})
+        self.assertEqual(resolver.pending_rows()[0].qbo_id, "210")
 
     def test_an_inactive_learned_account_is_not_seeded(self):
         self.assertEqual(decide_learned(["9"], {"1"}), (None, "account 9 is not active in QBO"))

@@ -31,6 +31,7 @@ from src.connectors.qbo_client import QBOClient  # noqa: E402
 from src.logic.account_map import (  # noqa: E402
     AccountResolver,
     fetch_qbo_accounts,
+    map_key,
     normalize_qbo_id,
     read_account_map,
     write_account_map_changes,
@@ -110,6 +111,29 @@ def decide_learned(learned: list[str | None], active_ids: set[str]) -> tuple[str
     return ids[0], ""
 
 
+def collect_unresolved(entries, resolver: AccountResolver, limit: int = SAMPLES_PER_NAME) -> dict:
+    """Names that do not resolve today, grouped by Account Map key, with synced-row samples.
+
+    `entries` yields (kind, column, name, QBO ID, amount). Spellings that differ only in case or
+    spaces share one map row, so their samples are pooled and judged together (two spellings
+    that posted to two accounts must not be seeded). Each spelling gets its own `limit`.
+    Names that do resolve are left to the resolver, which records their Auto rows.
+    """
+    groups: dict[str, dict] = {}
+    taken: dict[tuple[str, str], int] = defaultdict(int)
+    for kind, col, raw_name, qbo_id, amount in entries:
+        name = cell_text(raw_name)
+        if not name or resolver.resolve(name).ok:
+            continue
+        key = map_key(name)
+        group = groups.setdefault(key, {"name": name, "samples": []})
+        qid = normalize_qbo_id(qbo_id)
+        if qid and taken[(key, name)] < limit:
+            taken[(key, name)] += 1
+            group["samples"].append((kind, col, qid, amount))
+    return groups
+
+
 def _amount(value) -> float | None:
     try:
         return float(str(value).replace(",", ""))
@@ -155,32 +179,27 @@ def seed_client(gs, qbo: QBOClient, client: str, realm: str, sheet_id: str, writ
     resolver = AccountResolver(accounts, client, realm, read_account_map(gs, sheet_id))
     ctrl = gs.read_as_df(sheet_id, settings.CONTROL_TAB_NAME)
 
-    samples: dict[str, list[tuple[str, str, str, float | None]]] = defaultdict(list)
-    unresolved: set[str] = set()
-    tabs = 0
-    for url, tab, kind in _transform_tabs(ctrl):
-        df = _read_tab(gs, url, tab)
-        if df.empty:
-            continue
-        tabs += 1
-        for _, row in df.iterrows():
-            for col in TAB_COLUMNS[kind]:
-                name = cell_text(row.get(col, ""))
-                if not name:
-                    continue
-                if resolver.resolve(name).ok:
-                    continue
-                unresolved.add(name)
-                qbo_id = normalize_qbo_id(row.get("QBO ID", ""))
-                if qbo_id and len(samples[name]) < SAMPLES_PER_NAME:
-                    samples[name].append((kind, col, qbo_id, _amount(row.get("Amount"))))
-    print(f"   tabs read: {tabs}, names not resolving today: {len(unresolved)}")
+    tabs_read = []
+
+    def entries():
+        for url, tab, kind in _transform_tabs(ctrl):
+            df = _read_tab(gs, url, tab)
+            if df.empty:
+                continue
+            tabs_read.append(tab)
+            for _, row in df.iterrows():
+                for col in TAB_COLUMNS[kind]:
+                    yield kind, col, row.get(col, ""), row.get("QBO ID", ""), _amount(row.get("Amount"))
+
+    groups = collect_unresolved(entries(), resolver)
+    print(f"   tabs read: {len(tabs_read)}, names not resolving today: {len(groups)}")
 
     active_ids = set(accounts.values())
     not_seeded: dict[str, str] = {}
-    for name in sorted(unresolved):
+    for key in sorted(groups):
+        name = groups[key]["name"]
         learned: list[str | None] = []
-        for kind, col, qbo_id, amount in samples.get(name, []):
+        for kind, col, qbo_id, amount in groups[key]["samples"]:
             try:
                 data = qbo._get(f"/v3/company/{qbo.realm_id}/{QBO_ENTITY[kind]}/{qbo_id}"
                                 f"?minorversion={settings.QBO_MINOR_VERSION}")

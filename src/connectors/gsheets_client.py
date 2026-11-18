@@ -258,11 +258,12 @@ class GSheetsClient:
     @retry_with_backoff()
     def write_values_raw(self, spreadsheet_url_or_id: str, tab_name: str,
                          updates: list[tuple[str, list[list[str]]]],
-                         create_if_missing: bool = False) -> None:
+                         create_if_missing: bool = False, freeze_rows: int = 0) -> None:
         """Write [(A1 range, rows)] in one batch call, values stored exactly as given (RAW).
 
         RAW keeps typed text as text: an account name starting with '=' or an Id like '210'
-        is not turned into a formula or a number.
+        is not turned into a formula or a number. `freeze_rows` keeps that many top rows
+        frozen (a header that a sort cannot move).
         """
         if not updates:
             return
@@ -273,6 +274,10 @@ class GSheetsClient:
             if not create_if_missing:
                 raise
             ws = sh.add_worksheet(title=tab_name, rows=1000, cols=10)
+        if freeze_rows:
+            frozen = getattr(ws, "frozen_row_count", 0)
+            if not isinstance(frozen, int) or frozen < freeze_rows:
+                ws.freeze(rows=freeze_rows)
         ws.batch_update([{"range": a1, "values": vals} for a1, vals in updates],
                         value_input_option="RAW")
 

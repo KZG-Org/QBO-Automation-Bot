@@ -34,6 +34,10 @@ AUTO = "Auto"
 MANUAL = "Manual"
 
 
+class AccountMapError(ValueError):
+    """The Account Map tab cannot be trusted as it is (for example row 1 is not the header)."""
+
+
 def _is_blank(value) -> bool:
     if value is None:
         return True
@@ -276,7 +280,10 @@ class AccountResolver:
             return Resolution(acc_id, self._name_by_id[acc_id], "manual")
 
         saved = self._valid_saved_id(row)
-        if saved:
+        # The saved Id stands in for text that is gone from QBO (a rename). When the text still
+        # matches 2+ accounts, the saved Id may only pick one of them -- a QBO ID copied along
+        # with another row must not post to an account the row no longer names.
+        if saved and (not ids or saved in ids):
             return Resolution(saved, self._name_by_id[saved], "manual")
 
         problem = "which matches more than one QBO account" if len(ids) > 1 else "which is not in QBO"
@@ -299,14 +306,24 @@ def _cell(row, idx) -> str:
     return "" if value is None else str(value).strip()
 
 
+def _has_content(values) -> bool:
+    return bool(values) and any(str(c).strip() for row in values for c in row)
+
+
 def parse_account_map(values: list[list]) -> list[MapRow]:
-    """Rows of the tab, columns found by header name (the team may reorder or add columns)."""
-    if not values:
+    """Rows of the tab, columns found by header name (the team may reorder or add columns).
+
+    A tab with content but no 'Sheet Name' header on row 1 (sorted with row 1 unfrozen, or a
+    title row above the header) raises: reading it as empty would ignore every Manual row.
+    """
+    if not _has_content(values):
         return []
     cols = _header_index(values[0])
     if "sheet name" not in cols:
-        logger.warning("[Account Map] the tab has no 'Sheet Name' header; ignoring it")
-        return []
+        raise AccountMapError(
+            "row 1 of the Account Map tab is not the header (Sheet Name, QBO Account, QBO ID, "
+            "Type, Realm ID, Updated At). Put the header back on row 1."
+        )
     get = {h: cols.get(h.lower()) for h in ACCOUNT_MAP_HEADERS}
     rows = []
     for row_num, row in enumerate(values[1:], start=2):
@@ -357,9 +374,10 @@ def write_account_map_changes(gs, spreadsheet_id: str, changes: list[MapRow]) ->
 
     values = gs.read_tab_values(spreadsheet_id, ACCOUNT_MAP_TAB)
     create = values is None
+    fresh_rows = parse_account_map(values or [])  # raises when row 1 is not the header
     updates: list[tuple[str, list[list[str]]]] = []
 
-    if not values:
+    if not _has_content(values):
         cols = {h.lower(): i for i, h in enumerate(ACCOUNT_MAP_HEADERS)}
         updates.append(("A1", [list(ACCOUNT_MAP_HEADERS)]))
         last_row = 1
@@ -376,7 +394,7 @@ def write_account_map_changes(gs, spreadsheet_id: str, changes: list[MapRow]) ->
             (i for i, row in enumerate(values, start=1) if any(str(c).strip() for c in row)),
             default=1,
         )
-        existing = {map_key(r.sheet_name): (r.row_num, r.is_manual) for r in parse_account_map(values)}
+        existing = {map_key(r.sheet_name): (r.row_num, r.is_manual) for r in fresh_rows}
 
     def put(row_num: int, header: str, value: str) -> None:
         updates.append((rowcol_to_a1(row_num, cols[header.lower()] + 1), [[str(value or "")]]))
@@ -405,7 +423,8 @@ def write_account_map_changes(gs, spreadsheet_id: str, changes: list[MapRow]) ->
         written += 1
 
     if written:
-        gs.write_values_raw(spreadsheet_id, ACCOUNT_MAP_TAB, updates, create_if_missing=create)
+        # Row 1 stays frozen so a sort by the team cannot move the header.
+        gs.write_values_raw(spreadsheet_id, ACCOUNT_MAP_TAB, updates, create_if_missing=create, freeze_rows=1)
     return written
 
 
