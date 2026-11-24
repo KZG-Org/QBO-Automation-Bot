@@ -391,16 +391,15 @@ from`) always decreases and AO (`Transfer to`) always increases, whatever sign t
   from `Payment/banking` to `S5 Card - 8574` posts card +4.13, Payment/banking -4.13.
 - **Expenses**: AN is the paying bank and `Sub-category` the expense account; the line is |AL|.
 
-Row id. The bot builds each row's `No` from **`Txn ID`** (column A): `No` = 100,000,000 +
-`Txn ID` (Txn 5626 -> `100005626`). Column AQ is not read and needs no formula. `Txn ID` is
-typed, unique and only grows, so a row keeps its id when rows are sorted, and a back-dated row
-still lands above the checkpoint. Txn IDs follow the order rows were added, not the date (Txn
-5660 is an Aug 2026 row added later).
+Row id. The bot uses **`Txn ID`** (column A) as the row's `No` (Txn 5705 -> `No` 5705). Column
+AQ is not read and needs no formula. `Txn ID` is typed, unique and only grows, so a row keeps its
+id when rows are sorted, and a back-dated row still lands above the checkpoint. Txn IDs follow
+the order rows were added, not the date (Txn 5660 is an Aug 2026 row added later).
 
-Why the 100,000,000. Old-tab Nos are at most 12,319,999 (Dec 31 + a 4-digit count), and the
-bot never lowers an S5 `Last Processed Row` below the highest `No` in that row's Transform file.
-With the offset every new-tab `No` is above every old one, so a control row whose Transform
-file already holds old-tab Nos can still read the new tab. (S5 chose a separate row 12 anyway.)
+Use the new tab only on control rows whose Transform file holds new-tab rows (row 12 and later
+months). The bot never lowers an S5 `Last Processed Row` below the highest `No` in the row's
+Transform file, and old-tab Nos (e.g. 1115003) are far above any Txn ID, so a row that still
+holds old-tab output would see every new-tab row as already done.
 
 Start date. Rows with a `Payment Date` before **16 Nov 2026** (`S5_TRANSACTIONS_START` in
 `src/logic/raw_adapter.py`) get `No` 0, so they are never read from this tab: Nov 1-15 were
@@ -416,7 +415,7 @@ tab for 1-15 Nov. A `Month` of 2026-11-16 still reads from the 1st; the 16 Nov s
 `S5_TRANSACTIONS_START`.
 
 Late rows. A row whose QBO columns are filled after a later row was already transformed sits
-below the checkpoint. Put its `No` (100,000,000 + Txn ID) in `Pending Amount Nos` in the same
+below the checkpoint. Put its `No` (its Txn ID) in `Pending Amount Nos` in the same
 run in which its QBO Import is filled: the run picks it up. A `No` whose row still has no QBO
 Import is cleared from the cell at the end of the run.
 

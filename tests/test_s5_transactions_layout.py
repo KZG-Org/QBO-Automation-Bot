@@ -9,8 +9,6 @@ import unittest
 import pandas as pd
 
 from src.logic.raw_adapter import find_s5_header_row, standardize_raw_df
-
-BASE = 100_000_000  # new-tab No = BASE + Txn ID
 from src.logic.transformer import transform_raw
 
 HEADER = [
@@ -69,7 +67,7 @@ class S5TransactionsLayoutTests(unittest.TestCase):
 
     def test_columns_map_to_the_standard_names(self):
         std = _standardized().set_index("No")
-        staff = std.loc[BASE + 5628]
+        staff = std.loc[5628]
         self.assertEqual(staff["Date"], 46342)
         self.assertEqual(staff["CO"], "S5")
         self.assertEqual(staff["Type"], "Staff Welfare")  # Sub-category, not 'Purchase Invoice'
@@ -78,23 +76,23 @@ class S5TransactionsLayoutTests(unittest.TestCase):
 
     def test_expense_amount_follows_the_old_sign_convention(self):
         std = _standardized().set_index("No")
-        self.assertEqual(std.loc[BASE + 5628, "USD - QBO"], -99)        # money out
-        self.assertEqual(std.loc[BASE + 5628, "QBO Transfer Fr"], "S5 Payroll Cregis | TRC20")
-        self.assertEqual(std.loc[BASE + 5700, "USD - QBO"], -50)        # negative AL: same as +50
-        self.assertEqual(std.loc[BASE + 5700, "QBO Transfer Fr"], "S5 CC Card - 1981")
+        self.assertEqual(std.loc[5628, "USD - QBO"], -99)        # money out
+        self.assertEqual(std.loc[5628, "QBO Transfer Fr"], "S5 Payroll Cregis | TRC20")
+        self.assertEqual(std.loc[5700, "USD - QBO"], -50)        # negative AL: same as +50
+        self.assertEqual(std.loc[5700, "QBO Transfer Fr"], "S5 CC Card - 1981")
 
     def test_negative_journal_keeps_from_and_to(self):
         # S5: "Transferring $4.13 to S5 Card - 8574 increases the balance, while transferring
         # from Payment/Banking decreases it" -- AL is absolute, AN/AO are never swapped.
         std = _standardized().set_index("No")
-        fee = std.loc[BASE + 5665]
+        fee = std.loc[5665]
         self.assertEqual((fee["QBO Transfer Fr"], fee["QBO Transfer To"]), ("Payment/banking", "S5 CC Card - 1981"))
         self.assertEqual(fee["USD - QBO"], 5)
-        rev = std.loc[BASE + 5626]
+        rev = std.loc[5626]
         self.assertEqual((rev["QBO Transfer Fr"], rev["QBO Transfer To"]), ("Platform Fees - TH", "KZWL | TRC20"))
 
     def test_transfer_keeps_from_and_to(self):
-        tr = _standardized().set_index("No").loc[BASE + 5634]
+        tr = _standardized().set_index("No").loc[5634]
         self.assertEqual((tr["QBO Transfer Fr"], tr["QBO Transfer To"]),
                          ("S5 Finance Cregis | TRC20", "S5 CC Card - 1981"))
         self.assertEqual(tr["USD - QBO"], 30000)
@@ -102,12 +100,10 @@ class S5TransactionsLayoutTests(unittest.TestCase):
     def test_no_is_the_txn_id_and_column_aq_is_not_needed(self):
         # AQ is left empty in every test row: the Txn ID is the row id.
         std = _standardized()
-        self.assertEqual(sorted(std["No"].tolist()), [BASE + t for t in (5626, 5628, 5634, 5665, 5700)])
+        self.assertEqual(sorted(std["No"].tolist()), [5626, 5628, 5634, 5665, 5700])
 
-    def test_new_ids_are_above_every_old_tab_no(self):
-        # Row 10 (Nov) keeps its Transform file, whose Nos reach 1115003; the bot never lowers
-        # an S5 checkpoint below the file's top No. Old Nos are at most 12319999 (Dec 31 + count).
-        self.assertTrue((_standardized()["No"] > 12_319_999).all())
+    def test_no_is_the_plain_txn_id(self):
+        self.assertEqual(_standardized()["No"].max(), 5700)
 
     def test_rows_before_16_nov_2026_get_no_row_id(self):
         # Nov 1-15 were posted from the old tab; Txn 5660 is an Aug row added later.
@@ -121,7 +117,7 @@ class S5TransactionsLayoutTests(unittest.TestCase):
         std = standardize_raw_df(raw, "S5", "2026-11-01").set_index("Item Description")
         self.assertEqual(std.loc["15 Nov licence", "No"], 0)
         self.assertEqual(std.loc["Aug fees", "No"], 0)
-        self.assertEqual(std.loc["Staff birthday", "No"], BASE + 5628)
+        self.assertEqual(std.loc["Staff birthday", "No"], 5628)
 
     def test_missing_txn_ids_stop_instead_of_numbering_rows(self):
         # Numbering rows 1, 2, 3 (the old tab's fallback) would re-post Nov 1-15.
@@ -137,23 +133,23 @@ class S5TransactionsLayoutTests(unittest.TestCase):
         result = transform_raw(std, "S5", 0, 0, 0, {"accounts": ACCOUNTS, "locations": {}}, {}, "S5")
 
         jv = result.journals
-        fee = jv[jv["No"] == BASE + 5665].set_index("Account")["Amount"]
+        fee = jv[jv["No"] == 5665].set_index("Account")["Amount"]
         self.assertEqual(fee["S5 CC Card - 1981"], 5)    # To: increases
         self.assertEqual(fee["Payment/banking"], -5)     # From: decreases
-        rev = jv[jv["No"] == BASE + 5626].set_index("Account")["Amount"]
+        rev = jv[jv["No"] == 5626].set_index("Account")["Amount"]
         self.assertEqual(rev["KZWL | TRC20"], 85718.34)
         self.assertEqual(rev["Platform Fees - TH"], -85718.34)
 
         exp = result.expenses.set_index("No")
-        self.assertEqual(exp.loc[BASE + 5628, "Expense Line Amount"], 99)
-        self.assertEqual(exp.loc[BASE + 5628, "Account (Cr)"], "S5 Payroll Cregis | TRC20")
-        self.assertEqual(exp.loc[BASE + 5628, "Expense Account (Dr)"], "Staff Welfare")
-        self.assertEqual(exp.loc[BASE + 5700, "Expense Line Amount"], 50)
+        self.assertEqual(exp.loc[5628, "Expense Line Amount"], 99)
+        self.assertEqual(exp.loc[5628, "Account (Cr)"], "S5 Payroll Cregis | TRC20")
+        self.assertEqual(exp.loc[5628, "Expense Account (Dr)"], "Staff Welfare")
+        self.assertEqual(exp.loc[5700, "Expense Line Amount"], 50)
 
         tr = result.withdraw.set_index("No")
-        self.assertEqual(tr.loc[BASE + 5634, "Transfer Funds From"], "S5 Finance Cregis | TRC20")
-        self.assertEqual(tr.loc[BASE + 5634, "Transfer Funds To"], "S5 CC Card - 1981")
-        self.assertEqual(tr.loc[BASE + 5634, "Transfer Amount"], 30000)
+        self.assertEqual(tr.loc[5634, "Transfer Funds From"], "S5 Finance Cregis | TRC20")
+        self.assertEqual(tr.loc[5634, "Transfer Funds To"], "S5 CC Card - 1981")
+        self.assertEqual(tr.loc[5634, "Transfer Amount"], 30000)
         for frame in (jv, result.expenses, result.withdraw):
             self.assertTrue(frame["Remarks"].eq("Ready to sync").all(), frame["Remarks"].tolist())
 
