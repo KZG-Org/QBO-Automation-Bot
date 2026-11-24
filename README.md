@@ -332,8 +332,8 @@ the first 40 rows for a row carrying one alias from each of:
 
 | Group | Accepted headers |
 |---|---|
-| Country | `CO` |
-| Date | `Date` |
+| Country | `CO`, `Market / Entity` |
+| Date | `Date`, `Payment Date` |
 | Category | `Category` |
 | Bank | `Bank`, `Bank/Crypto` |
 | Method | `QBO Import`, `QBO Way` |
@@ -357,6 +357,53 @@ thin wrapper over those two and behaves exactly as before.
 
 Both `run_ingestion.py` and `run_reconciliation.py` go through `read_s5_raw_df()`. **KZO, KZP,
 KZDW and UMBER are unchanged** and keep their fixed header rows (1, 5/4, 5, 4 respectively).
+
+### S5 Transactions tab (from 16 Nov 2026)
+
+From 16 Nov 2026 S5 records transactions in the `Transactions` tab of the
+`2026-S5 Tech P&L- Report (R)` spreadsheet instead of `Transaction Records (NEW)` in the old
+`S5 - Transaction Records` file. Nov 1-15 stay on the old file and its control row
+(`Last Month Date` 2026-11-15); a second Nov control row points at the new tab.
+
+The new tab is recognised by its `Txn ID` and `Payment Date` headers (header on row 1). The QBO
+columns keep their names, AK:AQ:
+
+| Column | Header | Used as |
+|---|---|---|
+| AK | `QBO Import` | method (Journal / Expenses / Transfer) |
+| AL | `Final Amount to be take (different currency)` | amount (`=M`, the invoice amount) |
+| AM | `If Journal/Expense method: Another records` | fallback account |
+| AN | `Transfer from` | account the money leaves (credit) |
+| AO | `Transfer to` | account the money goes to (debit) |
+| AP | `Currency` | not used (S5 posts USD) |
+| AQ | `No` | row id for the checkpoint |
+
+Other columns: `Payment Date` is the posting date, `Market / Entity` is CO, `Description` is
+the memo, and `Sub-category` is the account the old `Type` column held. The new `Type` column
+(`Purchase Invoice` / `Sales Invoice`) is **not** used.
+
+Amount sign. AL reads "move AL from AN to AO":
+
+- **Journal / Transfer**: a positive AL credits AN and debits AO. A **negative** AL (Misc bank
+  fees, `Payment/banking`, Direction `Out`) swaps them, so the fee leaves the bank: e.g. -5 from
+  `Payment/banking` to `S5 CC Card - 1981` posts card -5, Payment/banking +5.
+- **Expenses**: AN is the paying bank and `Sub-category` the expense account. A positive AL is a
+  normal expense (line +AL); a negative AL is a refund (line -AL), as on the old tab.
+
+`No` (AQ) must be filled. The suggested formula, from row 2 down:
+
+```
+=IF(OR($AK2="",$C2<DATE(2026,11,16)),"",$A2)
+```
+
+It uses the `Txn ID`, which is typed, unique and only grows, so a row keeps its No when rows are
+sorted or added and a back-dated row still gets a No above the checkpoint. Rows before 16 Nov
+2026 get no No and are never read from this tab. If AQ is empty on every row, Transform stops
+with `column No (AQ) is empty` instead of numbering rows 1, 2, 3 (that fallback, still used on
+the old tab, would re-post Nov 1-15). The new Nov control row also starts with
+`Last Processed Row` = 5625 (the `Txn ID` just before the first 16 Nov row) as a second
+guard. Txn IDs follow the order rows were added, not the date (Txn 5660 is an Aug 2026
+row added later), which is why the formula also checks the date.
 
 ### KZO: blank header cells in the country tabs
 

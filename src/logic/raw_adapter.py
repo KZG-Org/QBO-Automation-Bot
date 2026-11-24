@@ -434,9 +434,11 @@ S5_HEADER_SEARCH_ROWS = 40
 # in standardize_raw_df, so a row this accepts is one that path will also recognise.
 # (has_s5_shape itself is deliberately left looser: it also classifies non-S5 clients
 # that happen to arrive in the S5 layout, and must not start demanding Date/Category.)
+# 'Market / Entity' and 'Payment Date' are the CO and Date of the 'Transactions' tab used
+# from 16 Nov 2026 (see _standardize_s5).
 S5_HEADER_ALIAS_GROUPS: tuple[tuple[str, ...], ...] = (
-    ("CO",),
-    ("Date",),
+    ("CO", "Market / Entity"),
+    ("Date", "Payment Date"),
     ("Category",),
     ("Bank", "Bank/Crypto"),
     ("QBO Import", "QBO Way"),
@@ -502,13 +504,23 @@ def _standardize_s5(
 ) -> pd.DataFrame:
     idx = df.index
 
-    co_col = _find_col(df, ["CO"])
+    # S5 'Transactions' tab (2026-S5 Tech P&L Report, from 16 Nov 2026): header on row 1,
+    # 'Payment Date' is the posting date, 'Type' is the invoice type (Purchase/Sales Invoice)
+    # and 'Sub-category' holds the account the old 'Type' column held. AL is the invoice
+    # amount, so a negative AL means the money moved from AO to AN (handled below).
+    is_transactions_tab = (
+        _find_col(df, ["Txn ID"]) is not None and _find_col(df, ["Payment Date"]) is not None
+    )
+
+    co_col = _find_col(df, ["CO", "Market / Entity"])
     coy_col = _find_col(df, ["COY"])
-    date_col = _find_col(df, ["Date"])
+    date_col = _find_col(df, ["Payment Date"] if is_transactions_tab else ["Date"])
     date_col_secondary = _find_col(df, ["Date._dup1", "Date.1"])
     category_col = _find_col(df, ["Category"])
-    type_col = _find_col(df, ["Type", "Sub Category", "Sub-category"])
-    desc_col = _find_col(df, ["Item Description"])
+    type_col = _find_col(
+        df, ["Sub-category", "Sub Category"] if is_transactions_tab else ["Type", "Sub Category", "Sub-category"]
+    )
+    desc_col = _find_col(df, ["Item Description", "Description"])
     trx_hash_col = _find_col(df, ["Trx Hash", "TrxHarsh"])
     currency_col = _find_col(df, ["Currency", "Currency From"])
     bank_col = _find_col(df, ["Bank", "Bank/Crypto", "From Account", "Bank ( To )", "Bank (To)", "Bank To"])
@@ -549,6 +561,19 @@ def _standardize_s5(
     transfer_to_vals = _value_series(col_or_empty(transfer_to_col))
     type_vals = _value_series(col_or_empty(type_col))
 
+    if is_transactions_tab:
+        # 'Move AL from AN (Transfer from) to AO (Transfer to)'. Journal and Transfer post the
+        # absolute amount from 'from' (credit) to 'to' (debit), so a negative AL swaps the two
+        # (a Misc bank fee leaves the bank). Expenses keep the bank as the paying account and the
+        # old sign convention (negative = money out), which the expense stage turns positive.
+        is_expense = method.str.contains("expense", case=False, na=False)
+        swap_sides = (amount < 0) & ~is_expense
+        transfer_from_vals, transfer_to_vals = (
+            transfer_from_vals.where(~swap_sides, transfer_to_vals),
+            transfer_to_vals.where(~swap_sides, transfer_from_vals),
+        )
+        amount = amount.abs().where(~is_expense, -amount)
+
     transfer_from_filled = transfer_from_vals.where(transfer_from_vals != "", bank_vals)
     transfer_from_filled = transfer_from_filled.where(transfer_from_filled != "", acc_cr_vals)
     transfer_to_filled = transfer_to_vals.where(transfer_to_vals != "", type_vals)
@@ -556,6 +581,13 @@ def _standardize_s5(
 
     no_series = pd.to_numeric(col_or_empty(no_col), errors="coerce")
     if no_series.fillna(0).eq(0).all():
+        if is_transactions_tab:
+            # Numbering rows by position here would give rows already posted from the old tab
+            # (before 16 Nov 2026) new Nos and post them twice.
+            raise ValueError(
+                "S5 'Transactions' tab: column No (AQ) is empty on every row. Fill the No formula "
+                "down the column before running Transform (README 'S5 Transactions tab')."
+            )
         no_series = pd.Series(range(1, len(df) + 1), index=idx, dtype="float64")
 
     co_vals = _value_series(col_or_empty(co_col))
