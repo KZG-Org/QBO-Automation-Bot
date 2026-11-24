@@ -363,8 +363,9 @@ KZDW and UMBER are unchanged** and keep their fixed header rows (1, 5/4, 5, 4 re
 From 16 Nov 2026 S5 records transactions in the `Transactions` tab of the
 `2026-S5 Tech P&L- Report (R)` spreadsheet instead of `Transaction Records (NEW)` in the old
 `S5 - Transaction Records` file. Nov 1-15 stay on the old file and its control row
-(`Last Month Date` 2026-11-15) until 24 Nov 2026, when that same row (row 10) was pointed
-at the new tab.
+(row 10, `Last Month Date` 2026-11-15). The new tab has its own control row (row 12, Month
+2026-11-16) with its own Transform file; its Journal / Expense / Transfer counters started from
+row 10's (271 / 71 / 12) so document numbers continue.
 
 The new tab is recognised by its `Txn ID` and `Payment Date` headers (header on row 1). The QBO
 columns keep their names, AK:AQ:
@@ -398,9 +399,8 @@ still lands above the checkpoint. Txn IDs follow the order rows were added, not 
 
 Why the 100,000,000. Old-tab Nos are at most 12,319,999 (Dec 31 + a 4-digit count), and the
 bot never lowers an S5 `Last Processed Row` below the highest `No` in that row's Transform file.
-With the offset every new-tab `No` is above every old one, so the **existing Nov control row
-(row 10)** keeps its Transform file, its `Last Processed Row` (1115003) and its Journal /
-Expense / Transfer counters, and simply continues with the new tab.
+With the offset every new-tab `No` is above every old one, so a control row whose Transform
+file already holds old-tab Nos can still read the new tab. (S5 chose a separate row 12 anyway.)
 
 Start date. Rows with a `Payment Date` before **16 Nov 2026** (`S5_TRANSACTIONS_START` in
 `src/logic/raw_adapter.py`) get `No` 0, so they are never read from this tab: Nov 1-15 were
@@ -408,8 +408,12 @@ posted from the old tab. If `Txn ID` is empty on every row, Transform stops with
 is empty` instead of numbering rows 1, 2, 3 (that fallback, still used on the old tab, would
 re-post Nov 1-15).
 
-Row 10 setup (S5 control sheet): `Source File` = the new spreadsheet, `Tab Name` =
-`Transactions`, `Last Month Date` blank; everything else unchanged.
+Row 12 setup (S5 control sheet): `Source File` = the new spreadsheet, `Tab Name` =
+`Transactions`, `Month` 2026-11-16, `Last Month Date` = the last day S5 has finished (2026-11-22
+for the first run; move it forward each week), `Transform File` blank (the bot creates one),
+`Last Journal No` / `Last Expense No` / `Last Transfer No` 271 / 71 / 12. Row 10 stays on the old
+tab for 1-15 Nov. A `Month` of 2026-11-16 still reads from the 1st; the 16 Nov start comes from
+`S5_TRANSACTIONS_START`.
 
 Late rows. A row whose QBO columns are filled after a later row was already transformed sits
 below the checkpoint. Put its `No` (100,000,000 + Txn ID) in `Pending Amount Nos` in the same
