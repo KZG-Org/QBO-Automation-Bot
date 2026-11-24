@@ -497,6 +497,19 @@ def read_s5_raw_df(gs, source_url: str, raw_tab_name: str, client_name: str = "S
     return df
 
 
+# First day read from S5's 'Transactions' tab. Earlier days were posted from the old
+# 'Transaction Records (NEW)' tab (README 'S5 Transactions tab').
+S5_TRANSACTIONS_START = pd.Timestamp("2026-11-16")
+
+
+def _s5_serial_or_text_dates(values: pd.Series) -> pd.Series:
+    """Sheet dates read UNFORMATTED (serial numbers) or as text, as Timestamps (NaT if unreadable)."""
+    serial = pd.to_numeric(values, errors="coerce")
+    from_serial = pd.to_datetime(serial, origin="1899-12-30", unit="D", errors="coerce")
+    from_text = pd.to_datetime(values.where(serial.isna()), errors="coerce", dayfirst=False)
+    return from_serial.fillna(from_text)
+
+
 def _standardize_s5(
     df: pd.DataFrame,
     prefer_secondary_date: bool = False,
@@ -579,16 +592,24 @@ def _standardize_s5(
     transfer_to_filled = transfer_to_vals.where(transfer_to_vals != "", type_vals)
     transfer_to_filled = transfer_to_filled.where(transfer_to_filled != "", bank_vals)
 
-    no_series = pd.to_numeric(col_or_empty(no_col), errors="coerce")
-    if no_series.fillna(0).eq(0).all():
-        if is_transactions_tab:
-            # Numbering rows by position here would give rows already posted from the old tab
-            # (before 16 Nov 2026) new Nos and post them twice.
+    if is_transactions_tab:
+        # The row id is the Txn ID: typed, unique, only grows, so a sort keeps it and a
+        # back-dated row still lands above the checkpoint. Column AQ ('No') is not needed.
+        # Rows dated before S5_TRANSACTIONS_START were posted from the old tab: they get no id
+        # (0), so they are never selected.
+        no_series = pd.to_numeric(col_or_empty(_find_col(df, ["Txn ID"])), errors="coerce")
+        if no_series.fillna(0).eq(0).all():
+            # Numbering rows by position (the old tab's fallback below) would re-post Nov 1-15.
             raise ValueError(
-                "S5 'Transactions' tab: column No (AQ) is empty on every row. Fill the No formula "
-                "down the column before running Transform (README 'S5 Transactions tab')."
+                "S5 'Transactions' tab: column Txn ID is empty on every row. "
+                "Check the header and the Txn ID column (README 'S5 Transactions tab')."
             )
-        no_series = pd.Series(range(1, len(df) + 1), index=idx, dtype="float64")
+        dates = _s5_serial_or_text_dates(col_or_empty(date_col))
+        no_series = no_series.where(dates >= S5_TRANSACTIONS_START, 0)
+    else:
+        no_series = pd.to_numeric(col_or_empty(no_col), errors="coerce")
+        if no_series.fillna(0).eq(0).all():
+            no_series = pd.Series(range(1, len(df) + 1), index=idx, dtype="float64")
 
     co_vals = _value_series(col_or_empty(co_col))
     coy_vals = _value_series(col_or_empty(coy_col))

@@ -27,7 +27,7 @@ HEADER = [
 def _row(txn, date, kind, cat, sub, desc, amount, bank, an, ao, fund_from="", typ="Purchase Invoice"):
     r = dict.fromkeys(range(len(HEADER)), "")
     r.update({0: txn, 2: date, 5: typ, 6: "S5", 8: cat, 9: sub, 10: desc, 11: "USDT", 12: amount,
-              21: cat, 26: fund_from, 27: bank, 36: kind, 37: amount, 39: an, 40: ao, 41: "USDT", 42: txn})
+              21: cat, 26: fund_from, 27: bank, 36: kind, 37: amount, 39: an, 40: ao, 41: "USDT", 42: ""})
     return [r[i] for i in range(len(HEADER))]
 
 
@@ -95,14 +95,32 @@ class S5TransactionsLayoutTests(unittest.TestCase):
                          ("S5 Finance Cregis | TRC20", "S5 CC Card - 1981"))
         self.assertEqual(tr["USD - QBO"], 30000)
 
-    def test_empty_no_column_stops_instead_of_numbering_rows(self):
-        # The old tab numbered rows 1, 2, 3 when No was empty. On this tab that would give
-        # Nov 1-15 rows (already posted from the old tab) fresh Nos and post them twice.
+    def test_no_is_the_txn_id_and_column_aq_is_not_needed(self):
+        # AQ is left empty in every test row: the Txn ID is the row id.
+        std = _standardized()
+        self.assertEqual(sorted(std["No"].tolist()), [5626, 5628, 5634, 5665, 5700])
+
+    def test_rows_before_16_nov_2026_get_no_row_id(self):
+        # Nov 1-15 were posted from the old tab; Txn 5660 is an Aug row added later.
+        grid = _grid() + [
+            _row(5620, 46341, "Expenses", "Infra", "Softwares", "15 Nov licence", 10,
+                 "S5 CC Card - 1981", "S5 CC Card - 1981", "Softwares"),
+            _row(5660, 46253, "Journal", "Platform Fees", "Platform Fees - TH", "Aug fees", 7,
+                 "KZWL | TRC20", "Platform Fees - TH", "KZWL | TRC20"),
+        ]
+        raw = pd.DataFrame(grid[1:], columns=grid[0])
+        std = standardize_raw_df(raw, "S5", "2026-11-01").set_index("Item Description")
+        self.assertEqual(std.loc["15 Nov licence", "No"], 0)
+        self.assertEqual(std.loc["Aug fees", "No"], 0)
+        self.assertEqual(std.loc["Staff birthday", "No"], 5628)
+
+    def test_missing_txn_ids_stop_instead_of_numbering_rows(self):
+        # Numbering rows 1, 2, 3 (the old tab's fallback) would re-post Nov 1-15.
         grid = _grid()
-        raw = pd.DataFrame([r[:-1] + [""] for r in grid[1:]], columns=grid[0])
+        raw = pd.DataFrame([[""] + r[1:] for r in grid[1:]], columns=grid[0])
         with self.assertRaises(ValueError) as ctx:
             standardize_raw_df(raw, "S5", "2026-11-01")
-        self.assertIn("No", str(ctx.exception))
+        self.assertIn("Txn ID", str(ctx.exception))
 
     def test_transform_posts_fees_out_of_the_bank_and_expenses_positive(self):
         std = _standardized()

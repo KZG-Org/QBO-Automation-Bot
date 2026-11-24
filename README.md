@@ -376,7 +376,7 @@ columns keep their names, AK:AQ:
 | AN | `Transfer from` | account the money leaves (credit) |
 | AO | `Transfer to` | account the money goes to (debit) |
 | AP | `Currency` | not used (S5 posts USD) |
-| AQ | `No` | row id for the checkpoint |
+| AQ | `No` | **not used** (the row id is `Txn ID`, column A) |
 
 Other columns: `Payment Date` is the posting date, `Market / Entity` is CO, `Description` is
 the memo, and `Sub-category` is the account the old `Type` column held. The new `Type` column
@@ -390,20 +390,17 @@ Amount sign. AL reads "move AL from AN to AO":
 - **Expenses**: AN is the paying bank and `Sub-category` the expense account. A positive AL is a
   normal expense (line +AL); a negative AL is a refund (line -AL), as on the old tab.
 
-`No` (AQ) must be filled. The suggested formula, from row 2 down:
+Row id. The bot uses **`Txn ID`** (column A) as the row's `No`; column AQ is not read and
+does not need a formula. `Txn ID` is typed, unique and only grows, so a row keeps its id when
+rows are sorted, and a back-dated row still lands above the checkpoint. Txn IDs follow the order
+rows were added, not the date (Txn 5660 is an Aug 2026 row added later).
 
-```
-=IF(OR($AK2="",$C2<DATE(2026,11,16)),"",$A2)
-```
-
-It uses the `Txn ID`, which is typed, unique and only grows, so a row keeps its No when rows are
-sorted or added and a back-dated row still gets a No above the checkpoint. Rows before 16 Nov
-2026 get no No and are never read from this tab. If AQ is empty on every row, Transform stops
-with `column No (AQ) is empty` instead of numbering rows 1, 2, 3 (that fallback, still used on
-the old tab, would re-post Nov 1-15). The new Nov control row also starts with
-`Last Processed Row` = 5625 (the `Txn ID` just before the first 16 Nov row) as a second
-guard. Txn IDs follow the order rows were added, not the date (Txn 5660 is an Aug 2026
-row added later), which is why the formula also checks the date.
+Start date. Rows with a `Payment Date` before **16 Nov 2026** (`S5_TRANSACTIONS_START` in
+`src/logic/raw_adapter.py`) get no id, so they are never read from this tab: Nov 1-15 were posted
+from the old tab. The new Nov control row also starts with `Last Processed Row` = 5625 (the
+`Txn ID` just before the first 16 Nov row) as a second guard. If `Txn ID` is empty on every row,
+Transform stops with `column Txn ID is empty` instead of numbering rows 1, 2, 3 (that fallback,
+still used on the old tab, would re-post Nov 1-15).
 
 ### KZO: blank header cells in the country tabs
 
