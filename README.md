@@ -382,13 +382,12 @@ Other columns: `Payment Date` is the posting date, `Market / Entity` is CO, `Des
 the memo, and `Sub-category` is the account the old `Type` column held. The new `Type` column
 (`Purchase Invoice` / `Sales Invoice`) is **not** used.
 
-Amount sign. AL reads "move AL from AN to AO":
+Amount sign. AL is read as an **absolute amount** (S5 confirmed 2026-11-24): AN (`Transfer
+from`) always decreases and AO (`Transfer to`) always increases, whatever sign the sheet shows.
 
-- **Journal / Transfer**: a positive AL credits AN and debits AO. A **negative** AL (Misc bank
-  fees, `Payment/banking`, Direction `Out`) swaps them, so the fee leaves the bank: e.g. -5 from
-  `Payment/banking` to `S5 CC Card - 1981` posts card -5, Payment/banking +5.
-- **Expenses**: AN is the paying bank and `Sub-category` the expense account. A positive AL is a
-  normal expense (line +AL); a negative AL is a refund (line -AL), as on the old tab.
+- **Journal / Transfer**: credit AN, debit AO, |AL|. Example (S5's own): Txn 5519, AL -4.13,
+  from `Payment/banking` to `S5 Card - 8574` posts card +4.13, Payment/banking -4.13.
+- **Expenses**: AN is the paying bank and `Sub-category` the expense account; the line is |AL|.
 
 Row id. The bot uses **`Txn ID`** (column A) as the row's `No`; column AQ is not read and
 does not need a formula. `Txn ID` is typed, unique and only grows, so a row keeps its id when

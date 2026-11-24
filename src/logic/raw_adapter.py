@@ -575,17 +575,12 @@ def _standardize_s5(
     type_vals = _value_series(col_or_empty(type_col))
 
     if is_transactions_tab:
-        # 'Move AL from AN (Transfer from) to AO (Transfer to)'. Journal and Transfer post the
-        # absolute amount from 'from' (credit) to 'to' (debit), so a negative AL swaps the two
-        # (a Misc bank fee leaves the bank). Expenses keep the bank as the paying account and the
-        # old sign convention (negative = money out), which the expense stage turns positive.
+        # AL is an absolute amount (S5, 2026-11-24): AN ('Transfer from') always decreases and
+        # AO ('Transfer to') always increases, whatever the sign in the sheet. Journal and
+        # Transfer already post |amount| from 'from' to 'to'. Expenses get the old tab's sign
+        # convention (negative = money out), which the expense stage turns into a positive line.
         is_expense = method.str.contains("expense", case=False, na=False)
-        swap_sides = (amount < 0) & ~is_expense
-        transfer_from_vals, transfer_to_vals = (
-            transfer_from_vals.where(~swap_sides, transfer_to_vals),
-            transfer_to_vals.where(~swap_sides, transfer_from_vals),
-        )
-        amount = amount.abs().where(~is_expense, -amount)
+        amount = amount.abs().where(~is_expense, -amount.abs())
 
     transfer_from_filled = transfer_from_vals.where(transfer_from_vals != "", bank_vals)
     transfer_from_filled = transfer_from_filled.where(transfer_from_filled != "", acc_cr_vals)

@@ -1,8 +1,8 @@
 """S5's new 'Transactions' tab (2026-S5 Tech P&L Report), used from 16 Nov 2026.
 
-Header on row 1; the QBO columns AK:AQ keep their names. AL is the invoice amount =M: positive
-for most rows, negative for Misc bank fees posted as Journal (money out of the bank). AN/AO
-read "move AL from AN to AO", so a negative AL moves the amount the other way.
+Header on row 1; the QBO columns AK:AQ keep their names. AL is read as an absolute amount
+(S5 confirmed 2026-11-24): AN ('Transfer from') always decreases and AO ('Transfer to') always
+increases, whatever the sign in the sheet.
 """
 import unittest
 
@@ -78,13 +78,15 @@ class S5TransactionsLayoutTests(unittest.TestCase):
         std = _standardized().set_index("No")
         self.assertEqual(std.loc[5628, "USD - QBO"], -99)        # money out
         self.assertEqual(std.loc[5628, "QBO Transfer Fr"], "S5 Payroll Cregis | TRC20")
-        self.assertEqual(std.loc[5700, "USD - QBO"], 50)         # refund: money back in
+        self.assertEqual(std.loc[5700, "USD - QBO"], -50)        # negative AL: same as +50
         self.assertEqual(std.loc[5700, "QBO Transfer Fr"], "S5 CC Card - 1981")
 
-    def test_negative_journal_moves_the_other_way(self):
+    def test_negative_journal_keeps_from_and_to(self):
+        # S5: "Transferring $4.13 to S5 Card - 8574 increases the balance, while transferring
+        # from Payment/Banking decreases it" -- AL is absolute, AN/AO are never swapped.
         std = _standardized().set_index("No")
         fee = std.loc[5665]
-        self.assertEqual((fee["QBO Transfer Fr"], fee["QBO Transfer To"]), ("S5 CC Card - 1981", "Payment/banking"))
+        self.assertEqual((fee["QBO Transfer Fr"], fee["QBO Transfer To"]), ("Payment/banking", "S5 CC Card - 1981"))
         self.assertEqual(fee["USD - QBO"], 5)
         rev = std.loc[5626]
         self.assertEqual((rev["QBO Transfer Fr"], rev["QBO Transfer To"]), ("Platform Fees - TH", "KZWL | TRC20"))
@@ -122,15 +124,15 @@ class S5TransactionsLayoutTests(unittest.TestCase):
             standardize_raw_df(raw, "S5", "2026-11-01")
         self.assertIn("Txn ID", str(ctx.exception))
 
-    def test_transform_posts_fees_out_of_the_bank_and_expenses_positive(self):
+    def test_transform_posts_absolute_amounts_from_an_to_ao(self):
         std = _standardized()
         std["No"] = pd.to_numeric(std["No"])
         result = transform_raw(std, "S5", 0, 0, 0, {"accounts": ACCOUNTS, "locations": {}}, {}, "S5")
 
         jv = result.journals
         fee = jv[jv["No"] == 5665].set_index("Account")["Amount"]
-        self.assertEqual(fee["S5 CC Card - 1981"], -5)   # credit the card
-        self.assertEqual(fee["Payment/banking"], 5)      # debit the fee
+        self.assertEqual(fee["S5 CC Card - 1981"], 5)    # To: increases
+        self.assertEqual(fee["Payment/banking"], -5)     # From: decreases
         rev = jv[jv["No"] == 5626].set_index("Account")["Amount"]
         self.assertEqual(rev["KZWL | TRC20"], 85718.34)
         self.assertEqual(rev["Platform Fees - TH"], -85718.34)
@@ -139,7 +141,7 @@ class S5TransactionsLayoutTests(unittest.TestCase):
         self.assertEqual(exp.loc[5628, "Expense Line Amount"], 99)
         self.assertEqual(exp.loc[5628, "Account (Cr)"], "S5 Payroll Cregis | TRC20")
         self.assertEqual(exp.loc[5628, "Expense Account (Dr)"], "Staff Welfare")
-        self.assertEqual(exp.loc[5700, "Expense Line Amount"], -50)
+        self.assertEqual(exp.loc[5700, "Expense Line Amount"], 50)
 
         tr = result.withdraw.set_index("No")
         self.assertEqual(tr.loc[5634, "Transfer Funds From"], "S5 Finance Cregis | TRC20")
