@@ -500,6 +500,11 @@ def read_s5_raw_df(gs, source_url: str, raw_tab_name: str, client_name: str = "S
 # First day read from S5's 'Transactions' tab. Earlier days were posted from the old
 # 'Transaction Records (NEW)' tab (README 'S5 Transactions tab').
 S5_TRANSACTIONS_START = pd.Timestamp("2026-11-16")
+# A new-tab row's No is this + its Txn ID (Txn 5626 -> 100005626). Old-tab Nos are at most
+# 12319999 (Dec 31 + a 4-digit count), and the bot never lowers an S5 checkpoint below the top No
+# of the row's Transform file, so the Nov control row can keep its file (Nos up to 1115003) and
+# still see every new row as new.
+S5_TRANSACTIONS_NO_BASE = 100_000_000
 
 
 def _s5_serial_or_text_dates(values: pd.Series) -> pd.Series:
@@ -588,7 +593,7 @@ def _standardize_s5(
     transfer_to_filled = transfer_to_filled.where(transfer_to_filled != "", bank_vals)
 
     if is_transactions_tab:
-        # The row id is the Txn ID: typed, unique, only grows, so a sort keeps it and a
+        # The row id is built from the Txn ID: typed, unique, only grows, so a sort keeps it and a
         # back-dated row still lands above the checkpoint. Column AQ ('No') is not needed.
         # Rows dated before S5_TRANSACTIONS_START were posted from the old tab: they get no id
         # (0), so they are never selected.
@@ -600,7 +605,7 @@ def _standardize_s5(
                 "Check the header and the Txn ID column (README 'S5 Transactions tab')."
             )
         dates = _s5_serial_or_text_dates(col_or_empty(date_col))
-        no_series = no_series.where(dates >= S5_TRANSACTIONS_START, 0)
+        no_series = (no_series + S5_TRANSACTIONS_NO_BASE).where(dates >= S5_TRANSACTIONS_START, 0)
     else:
         no_series = pd.to_numeric(col_or_empty(no_col), errors="coerce")
         if no_series.fillna(0).eq(0).all():
